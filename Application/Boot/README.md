@@ -26,3 +26,15 @@ Log bootloadera jest na tym samym wyjściu co log aplikacji głównej.
 Ustaw terminal na UART7 TX (PF7), 2000000 bodów, 8N1. Linie `[BOOT]`
 pokazują przejście do aplikacji, próbę połączenia przez ESP32, adres IP
 i port serwera HTTP.
+
+## Debug w STM32CubeIDE
+
+Zbuduj konfigurację **Debug**, a następnie uruchom dołączony profil
+`STM32h753bit6 Debug.launch` w projekcie bootloadera. Profil wgrywa plik
+ELF z symbolami i zatrzymuje procesor na początku `Boot_Main`. Użyj
+**F5** (Step Into) lub **F6** (Step Over). Jeżeli IDE ma zapisaną starszą
+konfigurację, wybierz dołączony plik `.launch` z tego projektu.
+
+Aplikacja główna i bootloader mają tę samą nazwę projektu Eclipse.
+Jeśli otwierasz oba w CubeIDE, użyj dwóch workspace'ów i wybierz profil
+Debug w workspace bootloadera.
