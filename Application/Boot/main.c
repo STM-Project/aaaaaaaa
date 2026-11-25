@@ -1,27 +1,27 @@
 #include "esp.h"
 #include "http.h"
+#include "image.h"
 #include "platform.h"
 #include "boot_lcd.h"
 #include "debug_uart.h"
 #include "main.h"
 
+#include <stdio.h>
+
 #define UPDATE_WINDOW_MS 120000u
 
 void Boot_Main(void)
 {
+    H753_BootRequest request;
+    bool requested = boot_read_request(&request);
+    if (!requested && boot_app_is_valid())
+        boot_jump_to_app();
+
     if (!boot_platform_init())
         for (;;) {}
 
     boot_debug_init();
     boot_debug("Start STM32H753");
-
-    H753_BootRequest request;
-    bool requested = boot_read_request(&request);
-    if (!requested && boot_app_is_valid()) {
-        boot_debug("Brak zadania aktualizacji. Start aplikacji 0x08020000.");
-        boot_debug_deinit();
-        boot_jump_to_app();
-    }
 
     extern void SystemClock_Config(void);
     SystemClock_Config();
@@ -75,7 +75,12 @@ void Boot_Main(void)
             if (link >= 0) {
                 enum http_result result = http_serve((unsigned)link, requested ? request.update_key : 0);
                 if (result == HTTP_INSTALLED) {
-                    boot_debug("Firmware zapisany. Reset i start aplikacji.");
+                    const volatile uint32_t *vectors = (const volatile uint32_t *)APP_FLASH_START;
+                    char message[76];
+                    snprintf(message, sizeof message, "Firmware zapisany. MSP=%08lX Reset_Handler=%08lX.",
+                             (unsigned long)vectors[0], (unsigned long)vectors[1]);
+                    boot_debug(message);
+                    boot_debug("Reset i start aplikacji.");
                     boot_delay(1200);
                     NVIC_SystemReset();
                 }

@@ -6,7 +6,6 @@
 #include <string.h>
 
 #define ESP_ENABLE_PIN GPIO_PIN_9
-#define ESP_UART_PINS (GPIO_PIN_6 | GPIO_PIN_7)
 static bool esp_uart_ready;
 
 uint32_t boot_millis(void)
@@ -139,20 +138,32 @@ bool boot_read_request(H753_BootRequest *request)
 {
     if (!(RCC->RSR & RCC_RSR_SFTRSTF))
         return false;
+    bool writable = (PWR->CR1 & PWR_CR1_DBP) != 0;
+    bool clock_enabled = (RCC->AHB4ENR & RCC_AHB4ENR_BKPRAMEN) != 0;
     PWR->CR1 |= PWR_CR1_DBP;
-    uint32_t started = boot_millis();
-    while (!(PWR->CR1 & PWR_CR1_DBP)) {
-        if (boot_millis() - started > 100u)
-            return false;
+
+    /* This check runs before HAL_Init and its millisecond clock. */
+    unsigned remaining = 4096;
+    while (!(PWR->CR1 & PWR_CR1_DBP) && --remaining) {}
+    if (!remaining) {
+        if (!writable)
+            PWR->CR1 &= ~PWR_CR1_DBP;
+        return false;
     }
     __HAL_RCC_BKPRAM_CLK_ENABLE();
     volatile H753_BootRequest *mailbox = (volatile H753_BootRequest *)H753_BOOT_MAILBOX_ADDRESS;
     *request = *mailbox;
-    if (request->magic != H753_BOOT_REQUEST_MAGIC)
+    bool present = request->magic == H753_BOOT_REQUEST_MAGIC;
+    if (present)
+        *mailbox = (H753_BootRequest){0};
+    __DSB();
+    if (!clock_enabled)
+        __HAL_RCC_BKPRAM_CLK_DISABLE();
+    if (!writable)
+        PWR->CR1 &= ~PWR_CR1_DBP;
+    if (!present)
         return false;
 
-    *mailbox = (H753_BootRequest){0};
-    __DSB();
     return request->check == H753_BootRequestCheck(request) &&
            request->port && request->ssid[0] && request->update_key[0] &&
            request->update_key[H753_UPDATE_KEY_LENGTH] == 0 &&
@@ -185,14 +196,6 @@ _Noreturn void boot_jump_to_app(void)
 {
     const volatile uint32_t *vectors = (const volatile uint32_t *)APP_FLASH_START;
     uint32_t msp = vectors[0], reset = vectors[1];
-    boot_esp_power(false);
-    if (esp_uart_ready) {
-        __HAL_RCC_USART6_FORCE_RESET();
-        __HAL_RCC_USART6_RELEASE_RESET();
-        __HAL_RCC_USART6_CLK_DISABLE();
-        HAL_GPIO_DeInit(GPIOC, ESP_UART_PINS);
-    }
-    HAL_GPIO_DeInit(GPIOA, ESP_ENABLE_PIN);
     __disable_irq();
     SysTick->CTRL = 0;
     SysTick->LOAD = 0;

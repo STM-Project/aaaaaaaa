@@ -26,8 +26,9 @@ na czas kasowania i programowania Flash.
 
 Log bootloadera jest na tym samym wyjściu co log aplikacji głównej.
 Ustaw terminal na UART7 TX (PF7), 2000000 bodów, 8N1. Linie `[BOOT]`
-pokazują przejście do aplikacji, próbę połączenia przez ESP32, adres IP
-i port serwera HTTP.
+pokazują próbę połączenia przez ESP32, adres IP, port HTTP i adres
+`Reset_Handler` po zakończeniu aktualizacji. Zwykły start poprawnej
+aplikacji przekazuje sterowanie przed inicjalizacją HAL i UART7 bootloadera.
 
 ## Debug w STM32CubeIDE
 

@@ -48,13 +48,3 @@ void boot_debug(const char *message)
     write_text("\r\n", start);
     while (!(UART7->ISR & USART_ISR_TC) && HAL_GetTick() - start < DEBUG_TIMEOUT_MS) {}
 }
-
-void boot_debug_deinit(void)
-{
-    if (!debug_enabled)
-        return;
-    UART7->CR1 = 0;
-    HAL_GPIO_DeInit(GPIOF, GPIO_PIN_7);
-    __HAL_RCC_UART7_CLK_DISABLE();
-    debug_enabled = 0;
-}
