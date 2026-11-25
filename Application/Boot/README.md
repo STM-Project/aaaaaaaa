@@ -21,3 +21,8 @@ USART6 przełącza ESP32 z fabrycznej prędkości 115200 na 2000000 bodów
 bootloader pozostaje na tej prędkości. Odbiór HTTP pozostaje pasywny
 (`AT+CIPRECVMODE=1`), dzięki czemu STM32 może wstrzymać pobieranie danych
 na czas kasowania i programowania Flash.
+
+Log bootloadera jest na tym samym wyjściu co log aplikacji głównej.
+Ustaw terminal na UART7 TX (PF7), 2000000 bodów, 8N1. Linie `[BOOT]`
+pokazują przejście do aplikacji, próbę połączenia przez ESP32, adres IP
+i port serwera HTTP.

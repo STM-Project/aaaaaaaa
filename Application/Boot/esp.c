@@ -1,4 +1,5 @@
 #include "esp.h"
+#include "debug_uart.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -109,11 +110,50 @@ static bool join_wifi(const H753_BootRequest *request)
             return false;
     }
     snprintf(cmd, sizeof cmd, "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
-    return send_command(cmd) && wait_line("OK", 22000u);
+    boot_debug("AT+CWJAP: laczenie z profilem STA.");
+    if (!send_command(cmd) || !wait_line("OK", 22000u)) {
+        boot_debug("AT+CWJAP: blad lub przekroczony czas laczenia.");
+        return false;
+    }
+    boot_debug("AT+CWJAP: polaczono z Wi-Fi.");
+    return true;
+}
+
+static bool read_wifi_address(bool station)
+{
+    const char *prefix = station ? "+CIFSR:STAIP,\"" : "+CIFSR:APIP,\"";
+    size_t prefix_length = strlen(prefix);
+    char address[16] = {0};
+    char line[96];
+    if (!send_command("AT+CIFSR\r\n"))
+        return false;
+    uint32_t deadline = boot_millis() + AT_TIMEOUT;
+    while (read_line(line, sizeof line, deadline)) {
+        if (!strcmp(line, "OK")) {
+            if (address[0]) {
+                char message[40];
+                snprintf(message, sizeof message, "%s IP: %s", station ? "STA" : "AP", address);
+                boot_debug(message);
+            }
+            return true;
+        }
+        if (!strcmp(line, "ERROR") || !strcmp(line, "FAIL"))
+            return false;
+        if (!strncmp(line, prefix, prefix_length)) {
+            const char *ip = line + prefix_length;
+            size_t length = strspn(ip, "0123456789.");
+            if (length && length < sizeof address && ip[length] == '"') {
+                memcpy(address, ip, length);
+                address[length] = 0;
+            }
+        }
+    }
+    return false;
 }
 
 bool esp_start(const H753_BootRequest *request, const char *recovery_password)
 {
+    boot_debug("ESP32: reset EN, sprawdzanie AT przy 115200 b/s.");
     boot_esp_power(false);
     boot_delay(100);
     boot_esp_power(true);
@@ -132,13 +172,17 @@ bool esp_start(const H753_BootRequest *request, const char *recovery_password)
     else if (!boot_uart_init(ESP_WORK_BAUD)) {
         return false;
     }
+    boot_debug("ESP32: proba AT przy 2000000 b/s.");
     if (!command("AT\r\n") || !command("ATE0\r\n") ||
         !command("AT+GMR\r\n") || !command("AT+SYSSTORE=0\r\n"))
         return false;
+    boot_debug("ESP32 odpowiada przy 2000000 b/s.");
     if (request) {
+        boot_debug("Konfiguracja STA, IP i DHCP z aplikacji.");
         if (!join_wifi(request))
             return false;
     } else {
+        boot_debug("Uruchamianie AP STM32H753-Boot.");
         char access_point[96];
         snprintf(access_point, sizeof access_point,
                  "AT+CWSAP=\"STM32H753-Boot\",\"%s\",5,3,1\r\n", recovery_password);
@@ -148,11 +192,19 @@ bool esp_start(const H753_BootRequest *request, const char *recovery_password)
     }
     char server[32];
     snprintf(server, sizeof server, "AT+CIPSERVER=1,%u\r\n", request ? request->port : 80u);
-    return command("AT+CIFSR\r\n") &&
+    if (!(read_wifi_address(request != NULL) &&
            command("AT+CIPDINFO=0\r\n") &&
            command("AT+CIPRECVMODE=1\r\n") &&
            command("AT+CIPSERVERMAXCONN=1\r\n") &&
-           command(server) && command("AT+CIPSTO=10\r\n");
+           command(server) && command("AT+CIPSTO=10\r\n"))) {
+        boot_debug("Blad konfiguracji serwera HTTP.");
+        return false;
+    }
+    char message[64];
+    snprintf(message, sizeof message, "HTTP gotowe, port %u, otworz /upload.",
+             request ? request->port : 80u);
+    boot_debug(message);
+    return true;
 }
 
 static bool parse_lengths(const char *line)
