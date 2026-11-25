@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define ESP_BOOT_BAUD 115200u
+#define ESP_WORK_BAUD 2000000u
 #define LINK_COUNT 5u
 #define AT_TIMEOUT 1500u
 static unsigned pending[LINK_COUNT];
@@ -80,24 +82,30 @@ static void format_ip(char out[16], uint32_t ip)
              (unsigned)(ip & 255u));
 }
 
+static bool start_wifi_mode(bool station, bool dhcp)
+{
+    return command(station ? "AT+CWMODE=1\r\n" : "AT+CWMODE=2\r\n") &&
+           command("AT+CWLAPOPT=1,23\r\n") &&
+           command("AT+CIPMUX=1\r\n") &&
+           command("AT+CWDHCP=0,3\r\n") &&
+           (!dhcp || command(station ? "AT+CWDHCP=1,1\r\n" : "AT+CWDHCP=1,2\r\n")) &&
+           command("AT+CWHOSTNAME=\"Elektronika_STM\"\r\n");
+}
+
 static bool join_wifi(const H753_BootRequest *request)
 {
     char ssid[129], password[129], cmd[288];
     if (!quote_at(ssid, sizeof ssid, request->ssid) ||
         !quote_at(password, sizeof password, request->password) ||
-        !command("AT+CWMODE=1\r\n") ||
-        !command("AT+CWHOSTNAME=\"Elektronika_STM\"\r\n"))
+        !start_wifi_mode(true, request->dhcp))
         return false;
-    if (request->dhcp) {
-        if (!command("AT+CWDHCP=1,1\r\n"))
-            return false;
-    } else {
+    if (!request->dhcp) {
         char ip[16], gateway[16], mask[16];
         format_ip(ip, request->ip);
         format_ip(gateway, request->gateway);
         format_ip(mask, request->mask);
         snprintf(cmd, sizeof cmd, "AT+CIPSTA=\"%s\",\"%s\",\"%s\"\r\n", ip, gateway, mask);
-        if (!command("AT+CWDHCP=0,1\r\n") || !command(cmd))
+        if (!command(cmd))
             return false;
     }
     snprintf(cmd, sizeof cmd, "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, password);
@@ -109,19 +117,23 @@ bool esp_start(const H753_BootRequest *request, const char *recovery_password)
     boot_esp_power(false);
     boot_delay(100);
     boot_esp_power(true);
-    if (!boot_uart_init(115200))
+    if (!boot_uart_init(ESP_BOOT_BAUD))
         return false;
     drain(900);
-    if (!command("AT\r\n")) {
-        if (!boot_uart_init(2000000) || !command("AT\r\n"))
+    if (command("AT\r\n")) {
+        if (!command("ATE0\r\n") ||
+            !send_command("AT+UART_CUR=2000000,8,1,0,0\r\n"))
             return false;
-        if (!send_command("AT+UART_CUR=115200,8,1,0,0\r\n"))
-            return false;
+        /* Some ESP-AT versions send OK at the old baud, others switch first. */
         drain(100);
-        if (!boot_uart_init(115200) || !command("AT\r\n"))
+        if (!boot_uart_init(ESP_WORK_BAUD))
             return false;
     }
-    if (!command("ATE0\r\n") || !command("AT+SYSSTORE=0\r\n"))
+    else if (!boot_uart_init(ESP_WORK_BAUD)) {
+        return false;
+    }
+    if (!command("AT\r\n") || !command("ATE0\r\n") ||
+        !command("AT+GMR\r\n") || !command("AT+SYSSTORE=0\r\n"))
         return false;
     if (request) {
         if (!join_wifi(request))
@@ -130,17 +142,17 @@ bool esp_start(const H753_BootRequest *request, const char *recovery_password)
         char access_point[96];
         snprintf(access_point, sizeof access_point,
                  "AT+CWSAP=\"STM32H753-Boot\",\"%s\",5,3,1\r\n", recovery_password);
-        if (!command("AT+CWMODE=2\r\n") || !command(access_point) ||
+        if (!start_wifi_mode(false, true) || !command(access_point) ||
             !command("AT+CIPAP=\"192.168.4.1\",\"192.168.4.1\",\"255.255.255.0\"\r\n"))
             return false;
     }
     char server[32];
     snprintf(server, sizeof server, "AT+CIPSERVER=1,%u\r\n", request ? request->port : 80u);
-    return command("AT+CIPMUX=1\r\n") &&
+    return command("AT+CIFSR\r\n") &&
            command("AT+CIPDINFO=0\r\n") &&
            command("AT+CIPRECVMODE=1\r\n") &&
            command("AT+CIPSERVERMAXCONN=1\r\n") &&
-           command(server);
+           command(server) && command("AT+CIPSTO=10\r\n");
 }
 
 static bool parse_lengths(const char *line)

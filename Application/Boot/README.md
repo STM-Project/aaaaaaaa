@@ -15,3 +15,9 @@ tej sieci jest losowane przy starcie i wyświetlane na LCD.
 Przeglądarka pokazuje postęp przesyłania pliku. LCD pokazuje postęp
 odbioru i zapisu we Flash, weryfikację CRC oraz wynik. Po udanym
 zapisie STM32 wykonuje reset i uruchamia aplikację.
+
+USART6 przełącza ESP32 z fabrycznej prędkości 115200 na 2000000 bodów
+(8N1), tak jak aplikacja H7. Jeśli moduł odpowiada już przy 2000000,
+bootloader pozostaje na tej prędkości. Odbiór HTTP pozostaje pasywny
+(`AT+CIPRECVMODE=1`), dzięki czemu STM32 może wstrzymać pobieranie danych
+na czas kasowania i programowania Flash.

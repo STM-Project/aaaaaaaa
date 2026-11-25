@@ -61,7 +61,9 @@ bool boot_uart_init(uint32_t baud)
         .AdvancedInit = {.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT,
                          .Swap = UART_ADVFEATURE_SWAP_ENABLE}
     };
-    return HAL_UART_Init(&uart) == HAL_OK;
+    /* Polling at 2 Mbaud needs the FIFO to absorb short interrupt latency. */
+    return HAL_UART_Init(&uart) == HAL_OK &&
+           HAL_UARTEx_EnableFifoMode(&uart) == HAL_OK;
 }
 
 bool boot_uart_send(const void *data, size_t length)
