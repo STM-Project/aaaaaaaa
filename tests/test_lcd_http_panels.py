@@ -1,0 +1,480 @@
+"""Execute both real LCD screens: clipping, scroll, touch feedback and live PWM.
+Also save 800x480 previews with host Arial-compatible glyphs (not hardware timing).
+"""
+from pathlib import Path
+import re,subprocess,tempfile,shutil,os,ast
+from PIL import Image,ImageFont
+ROOT=Path(__file__).resolve().parents[1]
+mode=re.search(r'typedef enum\s*\{\s*HTTP_MODE_RELAY.*?\} HTTP_PORT_MODE;',(ROOT/'Application/wwwPages.h').read_text(),re.S)[0]
+SUPPORT=r'''
+#ifndef SUPPORT_H
+#define SUPPORT_H
+#include <stdint.h>
+#include <stddef.h>
+typedef void* figureShape;
+#define LCD_RoundRectangle ((void*)2)
+typedef struct {uint16_t x,y;} XY_Touch_Struct;
+extern XY_Touch_Struct screenTouchPos;
+enum {press=1,release=0,FONT_12=12,FONT_16=16,FONT_20=20,FONT_18=18,FONT_28=28,Arial=0,fontID_13=12,fontID_17=16,fullHight=-3,NoConstWidth=0};
+void SCREEN_ResetAllParameters(void);void LCD_TOUCH_DeleteAllSetTouch(void);
+int LCD_LoadFont_ChangeColor(int,int,uint32_t);int LCD_GetFontHeight(int);int LCD_GetFontHalfHeight(int);
+int LCD_GetWholeStrPxlWidth(int,char*,int,int);
+void LCD_StrChangeColorWindow(uint32_t,uint32_t,uint32_t,int,int,int,char*,int,int,uint32_t,uint32_t,uint8_t,int);
+uint32_t LCD_GetXSize(void);uint32_t LCD_GetYSize(void);uint32_t HAL_GetTick(void);
+void LCD_DisplayBuff(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t*);
+void LCD_DisplayBuffStride(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t*,uint32_t);
+int LCD_TOUCH_isPress(void);XY_Touch_Struct LCD_TOUCH_GetPos(void);uint16_t LCD_TOUCH_GetTypeAndPosition(XY_Touch_Struct*);
+#endif
+'''
+C=r'''
+#include "SCREEN_HttpPanels.c"
+#include <assert.h>
+#include <stdlib.h>
+uint32_t pLcd[800*480];static uint32_t shown[800*480];
+static HTTP_LCDPanelData model;
+static int down,active,pwm_calls,toggle_calls,save_calls,draws,viewport_draws;
+static unsigned pwm_port,pwm_percent;
+static uint16_t native_event;
+static int native_creates,native_calls,native_releases,native_last,native_rows;
+static char *native_buffer;
+static int check_port_name,port_name_lines,port_name_font,status_messages;
+static uint32_t tick;
+static int check_description,description_lines,check_measurement,number_count,unit_count,check_percent,percent_count;
+static XY_Touch_Struct pos;
+XY_Touch_Struct screenTouchPos;
+unsigned lcdThresholdPort,lcdThresholdHumidity;static int threshold_active,threshold_back,form_save_calls;
+void SCREEN_NavigationRestore(void){}void SCREEN_NavigationEnter(uint32_t now,int d){(void)now;(void)d;}
+int LCD_SensorThresholds(uint8_t m){if(m==1)threshold_active=1;if(m==2)threshold_active=0;if(m==0&&threshold_back){threshold_back=0;return LCD_THRESH_BACK;}return 0;}
+static HTTP_LCDFormData formModel;
+static int form_read_delay;
+unsigned HTTP_LCDFormFieldIndex(const HTTP_LCDFormData*d,unsigned row){return d->names_only?d->port-1:row;}
+uint32_t HTTP_LCDFormOpenMode(unsigned port,unsigned mode,int names){
+ static unsigned serial;memset(&formModel,0,sizeof formModel);formModel.serial=++serial;formModel.port=port;formModel.mode=mode;
+ formModel.page=HTTP_LCDFormRoute(port,formModel.mode,names,&formModel.instance);assert(formModel.page);
+ formModel.names_only=names||!strcmp(formModel.page->route,"/set");formModel.count=formModel.names_only?1:formModel.page->field_count;formModel.status=LCD_FORM_READY;formModel.hash=1;
+ for(unsigned i=0;i<formModel.count;i++)snprintf(formModel.values[i],HTTP_LCD_FORM_VALUE,"%s",formModel.page->fields[HTTP_LCDFormFieldIndex(&formModel,i)].default_value);
+ return formModel.serial;
+}
+void HTTP_LCDFormClose(void){}
+int HTTP_LCDFormRead(HTTP_LCDFormData*out){if(form_read_delay||!formModel.serial)return 0;*out=formModel;return 1;}
+int HTTP_LCDFormSave(const HTTP_LCDFormData*base,const HTTP_LCDFormData*draft){assert(base->serial==formModel.serial);form_save_calls++;formModel=*draft;formModel.status=LCD_FORM_SAVED;formModel.hash++;return 1;}
+void SCREEN_ResetAllParameters(void){}void LCD_TOUCH_DeleteAllSetTouch(void){}
+void HTTP_LCDPanelActive(int a){active=a;}
+int HTTP_LCDPanelRead(HTTP_LCDPanelData*out){*out=model;return 1;}
+int HTTP_LCDPanelPwm(unsigned p,unsigned v){assert(p>=21&&p<=23&&v<=100);pwm_calls++;pwm_port=p;pwm_percent=v;model.ports[p-1].pwm=v;return 1;}
+static uint8_t saved_modes[33],saved_changed[33];
+static uint32_t save_serial,mode_request_serial,name_request_serial;
+static unsigned name_save_calls;
+static uint8_t saved_name_changed[33];
+static char saved_names[33][31];
+uint32_t HTTP_LCDPanelSaveNames(const uint8_t c[33],const char n[33][31],const char e[33][31]){
+ name_save_calls++;for(unsigned i=0;i<33;i++)if(c[i])assert(!strcmp(model.ports[i].name,e[i]));
+ memcpy(saved_name_changed,c,33);memcpy(saved_names,n,sizeof saved_names);return name_request_serial=++save_serial;
+}
+uint32_t HTTP_LCDPanelSaveModes(const uint8_t c[33],const uint8_t m[33],const uint8_t e[33]){
+ save_calls++;for(unsigned i=0;i<33;i++)if(c[i])assert(model.ports[i].mode==e[i]);
+ memcpy(saved_modes,m,33);memcpy(saved_changed,c,33);return mode_request_serial=++save_serial;
+}
+static void complete_save(int ok){
+ for(unsigned i=0;i<33;i++)if(ok&&saved_changed[i])model.ports[i].mode=saved_modes[i];
+ model.mode_result=ok?1:-2;model.mode_serial=mode_request_serial;tick+=250;
+ LCD_HttpPanel(0,1);
+}
+static void complete_names_save(int ok){
+ for(unsigned i=0;i<33;i++)if(ok&&saved_name_changed[i])strcpy(model.ports[i].name,saved_names[i]);
+ model.name_result=ok?1:-2;model.name_serial=name_request_serial;tick+=250;LCD_HttpPanel(0,1);
+}
+int HTTP_LCDPanelToggle(unsigned p){assert(p>=21&&p<=33);toggle_calls++;return 1;}
+int LCD_LoadFont_ChangeColor(int size,int style,uint32_t id){(void)style;if(id>fontID_17)return -1;return size;}
+int LCD_GetFontHeight(int font){return font==28?35:font==20?27:font==18?24:font==16?21:16;}
+int LCD_GetFontHalfHeight(int font){return LCD_GetFontHeight(font)-(font>=20?7:4);}
+int LCD_GetWholeStrPxlWidth(int f,char*t,int s,int c){(void)s;(void)c;int n=0;for(;*t;t++)n+=glyph_width[f==28?4:f==20?2:f==18?3:f==16?1:0][(unsigned char)*t];return n;}
+void LCD_StrChangeColorWindow(uint32_t offset,uint32_t w,uint32_t h,int font,int x,int y,char*t,int only,int space,uint32_t bg,uint32_t color,uint8_t a,int fixed){
+ assert(!strstr(t,"Odczyt / sterowanie"));
+ if(strstr(t,"Zapisywanie ustawien")||strstr(t,"Nie zapisano ustawien")||strstr(t,"Zapisano na SD")||strstr(t,"Niezapisane zmiany")){assert(h==TOP&&y>=48&&y+LCD_GetFontHeight(font)<=TOP);status_messages++;}
+ if(check_port_name){assert(!strstr(t,"..."));assert(color==WHITE);port_name_lines++;port_name_font=font;}
+ if(check_percent&&strchr(t,'%')){assert(!strcmp(t,"%")&&font==12);percent_count++;}
+ if(check_description){assert(font==12&&y==104+description_lines*18);description_lines++;}
+ if(check_measurement){if(!strcmp(t,"C")||!strcmp(t,"%")){assert(font==12&&y==43+LCD_GetFontHalfHeight(20)-LCD_GetFontHalfHeight(12));unit_count++;}else{assert(font==20&&y==43);if(number_count==1)assert(!strcmp(t,"65"));number_count++;}}
+ (void)only;(void)space;(void)bg;(void)a;(void)fixed;assert(offset==SCRATCH&&offset+w*h<=800*480&&x>=0&&y>=0);
+ int f=font==28?4:font==20?2:font==18?3:font==16?1:0;
+ for(;*t;t++){
+  unsigned c=(unsigned char)*t;assert(x+glyph_width[f][c]<=(int)w);
+  for(int row=0;row<glyph_height[f];row++)for(int col=0;col<glyph_width[f][c];col++){
+   assert(y+row<(int)h);unsigned alpha=glyphs[glyph_offset[f][c]+row*glyph_width[f][c]+col];
+   uint32_t *p=pLcd+offset+(y+row)*w+x+col;uint32_t mixed=0xff000000;
+   for(int shift=0;shift<=16;shift+=8)mixed|=((((color>>shift)&255)*alpha+((*p>>shift)&255)*(255-alpha))/255)<<shift;
+   *p=mixed;
+  }
+  x+=glyph_width[f][c];
+ }
+}
+uint32_t LCD_GetXSize(void){return 800;}uint32_t LCD_GetYSize(void){return 480;}uint32_t HAL_GetTick(void){return tick;}
+int LCD_TOUCH_isPress(void){return down;}XY_Touch_Struct LCD_TOUCH_GetPos(void){return pos;}
+uint16_t LCD_TOUCH_GetTypeAndPosition(XY_Touch_Struct*p){*p=pos;return native_event;}
+void LCD_DisplayBuff(uint32_t x,uint32_t y,uint32_t w,uint32_t h,uint32_t *s){
+ assert(x+w<=800&&y+h<=480&&s>=pLcd&&s+w*h<=pLcd+800*480);draws++;if(w==800&&(h==BASE_VIEW||h==SET_VIEW))viewport_draws++;
+ for(unsigned row=0;row<h;row++)memcpy(shown+(y+row)*800+x,s+row*w,w*4);
+}
+void LCD_DisplayBuffStride(uint32_t x,uint32_t y,uint32_t w,uint32_t h,uint32_t *s,uint32_t stride){
+ assert(x+w<=800&&y+h<=480&&s>=pLcd&&s+(h-1)*stride+w<=pLcd+800*480&&stride==800);draws++;
+ for(unsigned row=0;row<h;row++)memcpy(shown+(y+row)*800+x,s+row*stride,w*4);
+}
+void KEYBOARD_SetTextRows(unsigned rows){native_rows=(int)rows;}
+void KEYBOARD_SetGeneral(int a,int b,int c,int d,int e,int f,int g,int h,int i,int j){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;}
+int KEYBOARD_StartUp(int type,figureShape shape,uint8_t bold,uint16_t x,uint16_t y,uint16_t w,uint16_t h,uint8_t space,uint16_t forTouch,uint16_t start,uint8_t erase){
+ (void)bold;(void)space;(void)forTouch;(void)erase;if(type&&shape){assert(start==FORM_NATIVE_KEYS&&start+35<=255&&x==10&&y==65&&w>0&&h>0);native_creates++;}return 0;
+}
+void KEYBOARD__ServiceSetTxt(int k,int key,figureShape shape,uint8_t bold,uint16_t x,uint16_t y,uint16_t w,uint16_t h,uint8_t space,uint16_t forTouch,uint16_t start,uint8_t erase,int releaseKey,int action,int big,int back,int alt,int enter,int field,int style,int exitKey,uint32_t color,char *buffer,int size,int clearOnTap){
+ (void)k;(void)bold;(void)x;(void)y;(void)w;(void)h;(void)space;(void)forTouch;(void)start;(void)erase;(void)releaseKey;(void)action;(void)big;(void)back;(void)alt;(void)enter;(void)field;(void)style;(void)exitKey;(void)color;
+ assert(clearOnTap&&(size==33||size==23));native_calls++;native_buffer=buffer;
+ if(!key){native_last=0;native_releases++;}
+ if(!shape&&(key==KEYBOARD_CLEAR_TEXT||key==exitKey))memset(buffer,0,(size_t)size);
+ if(!shape&&key==KEY_Q){size_t n=strlen(buffer);if(native_last==key&&n)buffer[n-1]='1';else{assert(n+3<(size_t)size);buffer[n]='q';buffer[n+1]=0;}native_last=key;}
+ buffer[size-2]=1;buffer[size-1]=2; /* native cursor metadata must never be saved */
+}
+static void touch(int d,int x,int y){down=d;pos=(XY_Touch_Struct){(uint16_t)x,(uint16_t)y};tick+=20;assert(LCD_HttpPanel(0,ui.settings)==0);}
+static void form_touch_field(unsigned field){
+ FormControl box;assert(FormControlAt(field,&box));
+ lcdForm.scroll=Clamp(box.y-12,0,FormMaximum());FormDraw();
+ int y=TOP+box.y-lcdForm.scroll+44;
+ assert(y>=TOP&&y<TOP+VIEW);touch(1,box.x+box.w/2,y);touch(0,box.x+box.w/2,y);
+}
+static void check_form_geometry(void){
+ FormControl a,b;FormCard card;
+ unsigned count=lcdFormDraft.count+(lcdFormDraft.mode==HTTP_MODE_PWM);
+ for(unsigned i=0;i<count;i++){
+  assert(FormControlAt(i,&a)&&a.x>=36&&a.x+a.w<=726&&a.h==64);
+  int inside=0;for(unsigned c=0;FormCardAt(c,&card);c++)if(a.x>=card.x+3&&a.x+a.w<=card.x+card.w-3&&a.y>=card.y+44&&a.y+a.h<=card.y+card.h-3)inside=1;
+  assert(inside);assert(FormControlHit(a.x+a.w/2,a.y+44)==(int)i);
+  for(unsigned j=0;j<i;j++){assert(FormControlAt(j,&b));assert(a.x+a.w<=b.x||b.x+b.w<=a.x||a.y+a.h<=b.y||b.y+b.h<=a.y);}
+ }
+}
+/* Live updates without touch, HTTP request, or screen re-entry. */
+static void live_update(void){
+ int d=draws,full=viewport_draws;uint32_t hash=0;
+ for(unsigned i=0;i<800*480;i++)hash=hash*33+shown[i];
+ strcpy(model.ports[0].value[0],"31.8 C");tick+=250;
+ assert(LCD_HttpPanel(0,ui.settings)==0);
+ assert(!strcmp(ui.data.ports[0].value[0],"31.8 C")&&draws>d&&viewport_draws==full);
+ uint32_t after=0;for(unsigned i=0;i<800*480;i++)after=after*33+shown[i];assert(after!=hash);
+ d=draws;tick+=250;LCD_HttpPanel(0,ui.settings);assert(draws==d);
+ strcpy(model.ports[0].value[0],"25.6 C");tick+=250;LCD_HttpPanel(0,ui.settings);
+}
+static void preview(const char*name){char path[256];snprintf(path,sizeof path,"%s/%s.ppm",getenv("PREVIEW_DIR"),name);FILE*f=fopen(path,"wb");assert(f);fprintf(f,"P6\n800 480\n255\n");for(unsigned i=0;i<800*480;i++){fputc(shown[i]>>16,f);fputc(shown[i]>>8,f);fputc(shown[i],f);}fclose(f);}
+int SCREEN_NavigationNext(int,int);
+int main(void){
+ assert(RelayTextColor("Stan OFF")==0xff000000&&RelayTextColor("Stan ON")==WHITE);
+ for(unsigned i=0;i<33;i++){
+  HTTP_LCDPort*p=&model.ports[i];p->port=i+1;p->mode=i<4?HTTP_MODE_TEMP:i<8?HTTP_MODE_TEMP_RHU:i<14?HTTP_MODE_INPUT:i<16?HTTP_MODE_ADC:i<20?HTTP_MODE_COUNTER:i<23?HTTP_MODE_PWM:i<29?HTTP_MODE_RELAY:HTTP_MODE_TIMER;
+  snprintf(p->name,31,"Nazwa portu nr %u",i+1);snprintf(p->value[0],32,"%s",i<8?"25.6 C":i<14?"Stan OFF":i<16?"5.125 V":i<20?"1234.50 Wh":"Stan ON");
+  snprintf(p->value[1],32,"65.0 %%");for(unsigned r=2;r<5;r++)snprintf(p->value[r],32,"%u.125",r*123);for(unsigned r=0;r<5;r++)p->color[r]=0xffeeeeee;p->pwm=42;p->pwm_valid=1;
+ }
+ strcpy(model.time,"12:34:56");model.revision=1;
+ ui.font[0]=12;ui.font[1]=16;
+ char name_lines[2][96];assert(PortNameLines("WWWWWWWWWWWWWWWWWWWW",16,name_lines)==2);
+ assert(!PortNameLines("WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW",16,name_lines));
+ check_port_name=1;PortName(690,68,"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW");check_port_name=0;
+ assert(port_name_lines==2&&port_name_font==12);
+
+ assert(LCD_HttpPanel(1,0)==0&&active&&ui.count==33&&Maximum()>0);preview("lcd-http-read-top");
+ live_update();
+ check_description=1;Description(216,166,104,"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW");check_description=0;assert(description_lines==3);
+ check_measurement=1;Measurement(216,166,14,43,92,"25.6 C",WHITE,ui.font[2],0);Measurement(216,166,113,43,89,"65.0 %",WHITE,ui.font[2],2);check_measurement=0;assert(number_count==2&&unit_count==2);
+ check_percent=1;Measurement(216,166,14,43,150,"--- %",WHITE,ui.font[3],0);assert(percent_count==1);
+ Measurement(216,166,14,43,150,"--% %",WHITE,ui.font[3],0);assert(percent_count==2);check_percent=0;
+ Rect(216,0,0,216,166,CARD);Degree(216,10,10,WHITE);
+ assert(pLcd[SCRATCH+10*216+12]==WHITE&&pLcd[SCRATCH+12*216+12]==CARD);
+ int before=draws;tick+=500;LCD_HttpPanel(0,0);assert(draws==before); /* no redraw without changes */
+ touch(1,746,100);touch(1,746,435);touch(0,746,435);assert(ui.scroll==Maximum());preview("lcd-http-read-bottom");
+ /* Every scroll offset clips native text safely, including partial first/last cards. */
+ for(int s=0;s<=Maximum();s+=37){ui.scroll=s;ui.full=1;ui.dirty=1;LCD_HttpPanel(0,0);}
+ int index=-1;for(int i=0;i<ui.count;i++)if(ui.tiles[i].port==21)index=i;assert(index>=0);
+ ui.scroll=Clamp(ui.tiles[index].y,0,Maximum());ui.full=1;ui.dirty=1;LCD_HttpPanel(0,0);preview("lcd-http-pwm");
+ int x=ui.tiles[index].x,y=TOP+ui.tiles[index].y-ui.scroll+94;
+ int whole=viewport_draws;
+ touch(1,x+18,y);assert(pwm_port==21&&pwm_percent==0);touch(1,x+198,y);assert(pwm_percent==100);touch(0,x+198,y);assert(pwm_calls>=2&&viewport_draws==whole);
+ index=-1;for(int i=0;i<ui.count;i++)if(ui.tiles[i].port==28)index=i;assert(index>=0);
+ ui.scroll=Clamp(ui.tiles[index].y,0,Maximum());ui.full=1;ui.dirty=1;LCD_HttpPanel(0,0);
+ x=ui.tiles[index].x;y=TOP+ui.tiles[index].y-ui.scroll+60;
+ touch(1,x+90,y);assert(ui.pressed==28);touch(0,x+90,y);assert(toggle_calls==1);
+ touch(1,x+90,y);touch(1,x+90,y-20);touch(0,x+90,y-20);assert(toggle_calls==1);
+ assert(LCD_HttpPanel(2,0)==0&&!active);
+ assert(LCD_HttpPanel(1,1)==0&&active&&ui.count==33);assert(TOP==64&&VIEW==416&&SCRATCH==800u*416);assert(shown[479*800+SCROLL_X]==0xFF333333U);preview("lcd-http-settings-top");
+ strcpy(model.ports[0].name,"WWWWWWWWWWWWWWWWWWWWWWWWWWWWWW");tick+=250;LCD_HttpPanel(0,1);preview("lcd-http-settings-long-name");
+ strcpy(model.ports[0].name,"Nazwa portu nr 1");tick+=250;LCD_HttpPanel(0,1);
+
+ assert(shown[20*800+705]==shown[42*800+705]); /* solid save fill */
+ assert(shown[(TOP+20)*800+410]==shown[(TOP+44)*800+410]); /* solid dropdown */
+ assert(shown[(TOP+20)*800+700]==0xffeeeeee&&shown[(TOP+48)*800+700]==0xffeeeeee); /* white value field */
+ /* All four field corners expose the card background, unlike a rectangle. */
+ const int fx=CONTENT_X+442,fy=TOP+16;
+ assert(shown[fy*800+fx]==CARD&&shown[fy*800+fx+231]==CARD);
+ assert(shown[(fy+35)*800+fx]==CARD&&shown[(fy+35)*800+fx+231]==CARD);
+ assert(shown[fy*800+fx+4]==WHITE&&shown[(fy+4)*800+fx]==WHITE);
+ assert(shown[(TOP+16)*800+CONTENT_X+224]==CARD); /* dropdown corner */
+ assert(shown[(TOP+16)*800+CONTENT_X+228]==0xffbbbbbb);
+ assert(shown[14*800+538]!=0xff468ccf&&shown[14*800+542]==0xff468ccf); /* save corner */
+ live_update();
+ int old_pwm=pwm_calls,old_toggle=toggle_calls;
+ uint8_t options[6];assert(ModeOptions(1,options)==6&&options[0]==HTTP_MODE_TEMP&&options[4]==HTTP_MODE_EOL);
+ assert(ModeOptions(15,options)==2&&options[0]==HTTP_MODE_ADC);
+ assert(ModeOptions(17,options)==5&&options[3]==HTTP_MODE_COUNTER);
+ assert(ModeOptions(21,options)==6&&options[3]==HTTP_MODE_PWM);
+ assert(ModeOptions(24,options)==5&&options[3]==HTTP_MODE_IR);
+ assert(ModeOptions(33,options)==4&&options[3]==HTTP_MODE_DISABLED);
+ assert(!ModeOptions(0,options)&&!ModeOptions(34,options));
+ touch(1,CONTENT_X+300,TOP+30);touch(0,CONTENT_X+300,TOP+30);
+ assert(ui.menuPort==1&&!ui.menuUp&&ui.menuY>=TOP&&ui.menuY+ui.menuCount*MENU_ITEM+4<=TOP+VIEW);
+ preview("lcd-http-settings-dropdown");
+ int mx=ui.menuX+50,my=ui.menuY+2+MENU_ITEM+16;
+ touch(1,mx,my);touch(0,mx,my);tick+=250;LCD_HttpPanel(0,1);assert(!ui.menuPort&&ShownMode(1)==HTTP_MODE_PT1000&&model.ports[0].mode==HTTP_MODE_TEMP&&save_calls==0);
+ assert(pwm_calls==old_pwm&&toggle_calls==old_toggle);
+ touch(1,CONTENT_X+300,TOP+30);touch(0,CONTENT_X+300,TOP+30);
+ touch(1,50,TOP+30);touch(0,50,TOP+30);assert(!ui.menuPort&&ShownMode(1)==HTTP_MODE_PT1000);
+
+ whole=viewport_draws;
+ touch(1,CONTENT_X+410,TOP+30);assert(ui.pressed==1);preview("lcd-http-settings-pressed");
+ touch(0,CONTENT_X+410,TOP+30);assert(ui.pressed==-1&&ui.settings==1&&viewport_draws==whole);
+ assert(LCD_HttpPanelModal()&&threshold_active&&lcdThresholdPort==1);threshold_back=1;LCD_HttpPanel(0,1);
+ assert(!LCD_HttpPanelModal()&&ShownMode(1)==HTTP_MODE_PT1000&&model.ports[0].mode==HTTP_MODE_TEMP);
+ touch(1,CONTENT_X+410,TOP+30);touch(1,CONTENT_X+410,TOP+90);touch(0,CONTENT_X+410,TOP+90);assert(ui.scroll==0); /* clamp at top */
+ touch(1,100,400);touch(1,100,120);touch(0,100,120);assert(ui.scroll>0);
+ touch(1,746,75);touch(1,746,479);touch(0,746,479);assert(ui.scroll==Maximum()&&shown[479*800+SCROLL_X]==GREEN);preview("lcd-http-settings-bottom");
+
+ int row=32,field_y=TOP+ui.tiles[row].y-ui.scroll+30;
+ touch(1,CONTENT_X+300,field_y);touch(0,CONTENT_X+300,field_y);
+ assert(ui.menuPort==33&&ui.menuUp&&ui.menuY>=TOP&&ui.menuY+ui.menuCount*MENU_ITEM+4<=TOP+VIEW);
+ preview("lcd-http-settings-dropup");
+ mx=ui.menuX+50;my=ui.menuY+2+3*MENU_ITEM+16;
+ touch(1,mx,my);touch(0,mx,my);tick+=250;LCD_HttpPanel(0,1);
+ assert(ShownMode(33)==HTTP_MODE_DISABLED&&model.ports[32].mode==HTTP_MODE_TIMER&&save_calls==0);
+ assert(pwm_calls==old_pwm&&toggle_calls==old_toggle);
+ /* Drafts remain local across screen navigation. */
+ int old_scroll=ui.scroll;assert(LCD_HttpPanel(2,1)==0);assert(LCD_HttpPanel(1,0)==0);
+ assert(LCD_HttpPanel(2,0)==0);assert(LCD_HttpPanel(1,1)==0);
+ assert(ShownMode(1)==HTTP_MODE_PT1000&&ShownMode(33)==HTTP_MODE_DISABLED&&save_calls==0);
+ ui.scroll=old_scroll;ui.full=ui.dirty=1;LCD_HttpPanel(0,1);
+ /* Save is on release, drag outside cancels, both drafts commit in one batch. */
+ touch(1,630,30);assert(ui.savePressed&&save_calls==0);preview("lcd-http-settings-save-pressed");
+ touch(1,500,30);touch(0,500,30);assert(save_calls==0);
+ touch(1,630,30);touch(0,630,30);assert(save_calls==1&&edit.saving&&!edit.saved);preview("lcd-http-settings-saving");
+ assert(model.ports[0].mode==HTTP_MODE_TEMP&&saved_changed[0]&&saved_changed[32]);
+ complete_save(0);assert(edit.saveError&&!edit.saved&&edit.draftMode[0]>=0&&ShownMode(1)==HTTP_MODE_PT1000);
+ touch(1,630,30);touch(0,630,30);assert(save_calls==2);
+ complete_save(1);assert(!edit.saving&&!edit.saveError&&edit.saved&&edit.draftMode[0]==-1&&edit.draftMode[32]==-1);
+ assert(model.ports[0].mode==HTTP_MODE_PT1000&&model.ports[32].mode==HTTP_MODE_DISABLED);preview("lcd-http-settings-saved");
+ touch(1,630,30);touch(0,630,30);assert(save_calls==2); /* no edits, no SD writes */
+ assert(ui.tiles[32].y-ui.scroll+ui.tiles[32].h<=VIEW);
+ index=20;ui.scroll=Clamp(ui.tiles[index].y,0,Maximum());ui.full=1;ui.dirty=1;LCD_HttpPanel(0,1);
+ y=TOP+ui.tiles[index].y-ui.scroll+34;x=CONTENT_X;
+ touch(1,x+522,y);assert(pwm_port==21&&pwm_percent==0);
+ touch(1,x+666,y);assert(pwm_percent==100);touch(0,x+666,y);
+ preview("lcd-http-settings-pwm");
+ index=27;ui.scroll=Clamp(ui.tiles[index].y,0,Maximum());ui.full=1;ui.dirty=1;LCD_HttpPanel(0,1);
+ y=TOP+ui.tiles[index].y-ui.scroll+34;
+ old_toggle=toggle_calls;touch(1,x+570,y);assert(ui.outputPressed==28);touch(0,x+570,y);assert(toggle_calls==old_toggle+1);
+ preview("lcd-http-settings-relays");
+ /* A saved HTTP mode change updates LCD and disables the old relay/PWM controls. */
+ model.ports[27].mode=HTTP_MODE_TIMER;tick+=250;ui.full=1;ui.dirty=1;LCD_HttpPanel(0,1);
+ old_pwm=pwm_calls;touch(1,x+600,y);touch(0,x+600,y);assert(pwm_calls==old_pwm);
+
+ assert(LCD_HttpPanel(2,1)==0&&!active);
+ for(unsigned i=0;i<3;i++){
+  snprintf(model.thermometers[i].name,31,"Temperatura %u",i+1);model.thermometers[i].minimum=-100;model.thermometers[i].maximum=500;
+  model.thermometers[i].tenths=(int)(i*250)-100;model.thermometers[i].valid=1;
+ }
+ model.ports[27].mode=HTTP_MODE_RELAY;
+ assert(LCD_HttpPanel(1,2)==0&&ui.active);preview("lcd-lpc-thermometers");
+ int idle=draws;tick+=250;LCD_HttpPanel(0,2);assert(draws==idle);
+ old_toggle=toggle_calls;touch(1,90,TOP+340);assert(ui.pressed==28);touch(0,90,TOP+340);assert(toggle_calls==old_toggle+1);
+ touch(1,90,TOP+340);touch(0,790,TOP+340);assert(toggle_calls==old_toggle+1);
+ int before_value=draws;model.thermometers[0].tenths=200;tick+=250;LCD_HttpPanel(0,2);assert(draws>before_value);
+ model.thermometers[0].valid=0;tick+=250;LCD_HttpPanel(0,2);preview("lcd-lpc-thermometers-missing");
+ assert(LCD_HttpPanel(2,2)==0);
+ assert(ThermometerLiquid(0)==0xff0080ff&&ThermometerLiquid(1000)==0xffff0000);
+ for(unsigned level=0;level<=1000;level+=10){ThermometerDraw(236,8,28,level,1);}
+ ThermometerDraw(236,8,28,0,1);uint32_t blue=pLcd[SCRATCH+(28+250)*236+64];
+ ThermometerDraw(236,8,28,1000,1);uint32_t red=pLcd[SCRATCH+(28+250)*236+64];
+ assert((blue&255)>((blue>>16)&255)&&((red>>16)&255)>(red&255));
+ /* Configuration buttons open child editors, and return to the same /set scroll. */
+ assert(LCD_HttpPanel(1,1)==0);
+ touch(1,CONTENT_X+410,TOP+30);touch(0,CONTENT_X+410,TOP+30);assert(LCD_HttpPanelModal()&&threshold_active&&lcdThresholdPort==1&&!lcdThresholdHumidity);
+ threshold_back=1;LCD_HttpPanel(0,1);assert(!LCD_HttpPanelModal()&&!threshold_active&&ui.settings==1);
+ model.ports[14].mode=HTTP_MODE_ADC;tick+=250;LCD_HttpPanel(0,1);
+ ui.scroll=Clamp(ui.tiles[14].y,0,Maximum());ui.full=ui.dirty=1;LCD_HttpPanel(0,1);
+ touch(1,CONTENT_X+410,TOP+30);touch(0,CONTENT_X+410,TOP+30);assert(LCD_HttpPanelModal());LCD_HttpPanel(0,1);
+ assert(lcdFormDraft.count==301&&FormContentHeight()>6400&&FormMaximum()>0);check_form_geometry();preview("lcd-settings-adc-top");
+ form_touch_field(0);assert(lcdForm.editing==0&&lcdForm.selection==0);
+ touch(1,100,TOP+78);touch(0,100,TOP+78);assert(!strcmp(lcdFormDraft.values[0],"-"));
+ form_touch_field(1);assert(lcdForm.editing==1&&lcdForm.selection<0);
+ assert(shown[(TOP+8)*W+750]==0xFFFFFFFFU&&shown[(TOP+51)*W+750]==0xFFEDEDEDU);
+ assert(shown[30*W+445]==0xFFC83A48U);
+ touch(1,500,30);touch(0,500,30);assert(!lcdForm.text[0]);
+ touch(1,55,TOP+92);touch(0,55,TOP+92);touch(1,132,TOP+92);touch(0,132,TOP+92);assert(!strcmp(lcdForm.text,"12"));
+ preview("lcd-settings-keyboard");touch(1,630,30);touch(0,630,30);assert(lcdForm.editing==-1&&!strcmp(lcdFormDraft.values[1],"12"));
+ touch(1,746,100);touch(1,746,400);touch(0,746,400);assert(lcdForm.scroll>0);
+ lcdForm.scroll=FormMaximum();FormDraw();preview("lcd-settings-adc-bottom");
+ touch(1,630,30);touch(0,630,30);LCD_HttpPanel(0,1);assert(form_save_calls==1&&!lcdForm.dirty&&!lcdForm.pending);
+ assert(!strcmp(formModel.values[1],"12"));
+ strcpy(formModel.values[1],"99");formModel.hash++;tick+=250;LCD_HttpPanel(0,1);assert(!strcmp(lcdFormDraft.values[1],"99"));
+ touch(1,70,30);touch(0,70,30);assert(!LCD_HttpPanelModal()&&ui.settings==1);
+ char original_name[31];strcpy(original_name,model.ports[14].name);
+ int created_before=native_creates;unsigned name_writes_before=name_save_calls;
+ touch(1,CONTENT_X+60,TOP+30);touch(0,CONTENT_X+60,TOP+30);
+ assert(LCD_HttpPanelModal()&&lcdForm.directName&&lcdForm.nativeActive&&lcdForm.editing==0&&native_creates==created_before+1&&native_rows==1);
+ native_event=FORM_NATIVE_KEYS;touch(1,100,180);int releases_before=native_releases;touch(1,100,180);assert(native_releases==releases_before&&native_buffer[strlen(native_buffer)-1]=='1');
+ int native_full_before=viewport_draws,native_created_before=native_creates;
+ native_event=0;touch(1,100,280);assert(viewport_draws==native_full_before&&native_creates==native_created_before);
+ native_event=0;touch(0,100,280);assert(native_releases==releases_before+1);
+ touch(1,630,30);touch(0,630,30);
+ assert(!LCD_HttpPanelModal()&&!lcdForm.nativeActive&&native_rows==6&&edit.nameChanged[14]);
+ assert(!strcmp(model.ports[14].name,original_name)&&name_save_calls==name_writes_before);
+ char local_name[31];strcpy(local_name,edit.names[14]);assert(strcmp(local_name,original_name));
+ touch(1,CONTENT_X+60,TOP+30);touch(0,CONTENT_X+60,TOP+30);assert(lcdForm.nativeActive&&!strcmp(native_buffer,local_name));
+ strcpy(native_buffer,"Anulowana nazwa");touch(1,70,30);touch(0,70,30);
+ assert(!LCD_HttpPanelModal()&&!strcmp(edit.names[14],local_name));
+ touch(1,CONTENT_X+60,TOP+30);touch(0,CONTENT_X+60,TOP+30);int stable_creates=native_creates,stable_view=viewport_draws;
+ strcpy(native_buffer,"Wyczysc klawiszem X");touch(1,100,280);assert(native_buffer[0]);
+ native_event=FORM_NATIVE_KEYS+KEY_exit-KEY_Q;touch(0,100,280);native_event=0;assert(lcdForm.nativeActive&&!native_buffer[0]&&native_creates==stable_creates&&viewport_draws==stable_view);
+ strcpy(native_buffer,"Wyczysc przyciskiem");touch(1,500,30);touch(0,500,30);
+ assert(lcdForm.nativeActive&&!native_buffer[0]&&native_creates==stable_creates&&viewport_draws==stable_view);
+ touch(1,70,30);touch(0,70,30);assert(!LCD_HttpPanelModal()&&!strcmp(edit.names[14],local_name));
+ /* Only the parent Save commits names. A failed SD write retains the draft. */
+ touch(1,630,30);touch(0,630,30);assert(edit.savingNames&&name_save_calls==name_writes_before+1);
+ complete_names_save(0);assert(edit.saveError&&edit.nameChanged[14]&&!strcmp(model.ports[14].name,original_name));
+ touch(1,630,30);touch(0,630,30);complete_names_save(1);
+ assert(!edit.nameChanged[14]&&edit.saved&&!strcmp(model.ports[14].name,local_name));
+ /* Independent results retain only failed drafts when names and types save together. */
+ edit.draftMode[14]=HTTP_MODE_DISABLED;edit.draftBase[14]=model.ports[14].mode;
+ edit.nameChanged[14]=1;strcpy(edit.nameBase[14],model.ports[14].name);strcpy(edit.names[14],"Nazwa po czesciowym zapisie");
+ touch(1,630,30);touch(0,630,30);assert(edit.saving&&edit.savingNames);
+ complete_save(0);complete_names_save(1);assert(edit.saveError&&edit.draftMode[14]>=0&&!edit.nameChanged[14]);
+ touch(1,630,30);touch(0,630,30);complete_save(1);assert(edit.saved&&edit.draftMode[14]<0);
+ puts("PASS: name click opens native keyboard directly; Done stages locally; only parent Save writes; cancel, SD retry and partial result handling preserve drafts.");
+ model.ports[27].mode=HTTP_MODE_TIMER;tick+=250;LCD_HttpPanel(0,1);
+ assert(SettingsOpen(28,0));LCD_HttpPanel(0,1);assert(lcdFormDraft.count==19);preview("lcd-settings-timer");
+ form_touch_field(8);assert(!strcmp(lcdFormDraft.values[8],"1"));
+ touch(1,500,30);touch(0,500,30);assert(!lcdForm.dirty);touch(1,70,30);touch(0,70,30);assert(!LCD_HttpPanelModal());
+ model.ports[27].mode=HTTP_MODE_THERMOSTAT;tick+=250;LCD_HttpPanel(0,1);
+ assert(SettingsOpen(28,0));LCD_HttpPanel(0,1);assert(lcdFormDraft.count==7);
+ char option_label[64];FormOptionLabel(FormField(0),"T01",option_label,sizeof option_label);assert(!strcmp(option_label,"Temp. port 1"));
+ form_touch_field(0);assert(lcdForm.selection==0);preview("lcd-settings-thermostat-options");
+ touch(1,100,400);touch(1,100,140);touch(0,100,140);assert(lcdForm.selection>0);
+ touch(1,70,30);touch(0,70,30);touch(1,70,30);touch(0,70,30);assert(!LCD_HttpPanelModal());
+ /* Open every output editor by its real /set numeric touch button,
+    including the lower rows after scrolling, rather than calling SettingsOpen. */
+ const unsigned output_modes[]={HTTP_MODE_RELAY,HTTP_MODE_TIMER,HTTP_MODE_THERMOSTAT,HTTP_MODE_IR};
+ for(unsigned port=21;port<=33;port++)for(unsigned mode=0;mode<4;mode++){
+  if(mode==3&&port>27)continue;
+  model.ports[port-1].mode=output_modes[mode];edit.draftMode[port-1]=-1;tick+=250;LCD_HttpPanel(0,1);
+  int tile=-1;for(int i=0;i<ui.count;i++)if((unsigned)ui.tiles[i].port==port)tile=i;assert(tile>=0);
+  ui.scroll=Clamp(ui.tiles[tile].y,0,Maximum());ui.full=ui.dirty=1;LCD_HttpPanel(0,1);
+  int x=ui.tiles[tile].x+410,y=TOP+ui.tiles[tile].y-ui.scroll+30;
+  if(port==28&&mode==0){
+   /* Reboot-retained GUI base can even match the next freshly allocated ID. */
+   lcdFormBase=formModel;lcdFormBase.serial=formModel.serial+1;lcdFormBase.hash=1;lcdFormBase.pwm=0;
+   memset(&lcdFormDraft,0xA5,sizeof lcdFormDraft);memset(&lcdFormLatest,0xA5,sizeof lcdFormLatest);
+   form_read_delay=1;
+  }
+  assert(y>=TOP&&y<TOP+VIEW);touch(1,x,y);touch(0,x,y);assert(LCD_HttpPanelModal());LCD_HttpPanel(0,1);
+  if(port==28&&mode==0){
+   assert(FormLoading()&&lcdFormDraft.page&&!strcmp(lcdFormDraft.page->route,"/wypk")&&lcdFormDraft.count==3);
+   unsigned visible=0;for(unsigned i=TOP*W;i<(unsigned)((TOP+VIEW)*W);i++)if(shown[i]!=BG)visible++;assert(visible>10000);
+   preview("lcd-settings-relay-loading");
+   int saves_before=form_save_calls;
+   form_touch_field(0);assert(lcdForm.editing==-1&&!lcdForm.dirty);
+   touch(1,630,30);touch(0,630,30);assert(form_save_calls==saves_before);
+   form_read_delay=0;LCD_HttpPanel(0,1);assert(!FormLoading());
+  }
+  assert(lcdFormDraft.port==port&&lcdFormDraft.count==(mode==1?19:mode==2?7:3));check_form_geometry();
+  assert(!strcmp(lcdFormDraft.page->route,mode==1?"/tim":mode==2?"/term":"/wypk"));
+  if(port==28&&mode==0)preview("lcd-settings-relay");
+  if(port==28&&mode==2)preview("lcd-settings-thermostat");
+  if(port==28&&mode==1){lcdForm.scroll=340;FormDraw();preview("lcd-settings-timer-days");lcdForm.scroll=FormMaximum();FormDraw();preview("lcd-settings-timer-names");lcdForm.scroll=0;FormDraw();}
+  touch(1,70,30);touch(0,70,30);assert(!LCD_HttpPanelModal());
+ }
+ const struct{unsigned port,mode;const char*preview;} other_forms[]={
+  {1,HTTP_MODE_INPUT,"lcd-settings-input"},{1,HTTP_MODE_EOL,"lcd-settings-eol"},{17,HTTP_MODE_COUNTER,"lcd-settings-counter"},{21,HTTP_MODE_PWM,"lcd-settings-pwm"}};
+ for(unsigned i=0;i<sizeof other_forms/sizeof *other_forms;i++){
+  model.ports[other_forms[i].port-1].mode=other_forms[i].mode;edit.draftMode[other_forms[i].port-1]=-1;tick+=250;LCD_HttpPanel(0,1);
+  assert(SettingsOpen(other_forms[i].port,0));LCD_HttpPanel(0,1);check_form_geometry();preview(other_forms[i].preview);
+  touch(1,70,30);touch(0,70,30);assert(!LCD_HttpPanelModal());
+ }
+ /* Real dropdown -> numeric button -> chosen editor -> Back for every port
+    and every supported option. No header Save is issued during this sequence. */
+ int mode_saves_before=save_calls;
+ for(unsigned port=1;port<=33;port++){
+  model.ports[port-1].mode=HTTP_MODE_DISABLED;edit.draftMode[port-1]=-1;tick+=250;LCD_HttpPanel(0,1);
+  uint8_t options[6];unsigned option_count=ModeOptions(port,options);
+  for(unsigned option=0;option<option_count;option++){
+   int tile=-1;for(int i=0;i<ui.count;i++)if((unsigned)ui.tiles[i].port==port)tile=i;assert(tile>=0);
+   ui.scroll=Clamp(ui.tiles[tile].y,0,Maximum());ui.full=ui.dirty=1;LCD_HttpPanel(0,1);
+   int y=TOP+ui.tiles[tile].y-ui.scroll+30;
+   touch(1,CONTENT_X+240,y);touch(0,CONTENT_X+240,y);assert(ui.menuPort==(int)port);
+   int mx=ui.menuX+20,my=ui.menuY+2+(int)option*MENU_ITEM+MENU_ITEM/2;
+   touch(1,mx,my);touch(0,mx,my);assert(ShownMode(port)==options[option]);
+   assert(model.ports[port-1].mode==HTTP_MODE_DISABLED&&save_calls==mode_saves_before);
+   touch(1,CONTENT_X+410,y);touch(0,CONTENT_X+410,y);assert(LCD_HttpPanelModal());
+   if(options[option]==HTTP_MODE_TEMP||options[option]==HTTP_MODE_TEMP_RHU||options[option]==HTTP_MODE_PT1000){
+    assert(threshold_active&&lcdThresholdPort==port&&lcdThresholdHumidity==(unsigned)(options[option]==HTTP_MODE_TEMP_RHU));threshold_back=1;LCD_HttpPanel(0,1);
+   }else{
+    LCD_HttpPanel(0,1);assert(lcdFormDraft.mode==options[option]);
+    if(options[option]==HTTP_MODE_PWM&&FormModePending()){FormControl b;assert(FormControlAt(lcdFormDraft.count,&b));assert(FormControlHit(b.x+b.w/2,b.y+44)==-1);}
+    touch(1,70,30);touch(0,70,30);
+   }
+   assert(!LCD_HttpPanelModal()&&ShownMode(port)==options[option]);
+   assert(model.ports[port-1].mode==HTTP_MODE_DISABLED&&save_calls==mode_saves_before);
+  }
+ }
+ assert(status_messages>4);
+ puts("PASS: /set status messages stay in header; viewport/scrollbar reach y=479; modal and other panels retain independent scratch bounds.");
+ puts("PASS: all 33 ports open the dropdown draft before Save, preserve it after Back and never commit the port type implicitly.");
+ puts("PASS: relay/IR, timer and thermostat editors open by touch for every physical output, with scrolling and Back.");
+ assert(LCD_HttpPanel(2,1)==0);
+ for(int dir=-1;dir<=1;dir+=2){
+  int current=0,entered=0;
+  for(int i=0;i<26;i++){
+   current=SCREEN_NavigationNext(current,dir);assert(current!=10);
+   if(current>=11&&current<=13){assert(LCD_HttpPanel(1,current-11)==0&&ui.active);assert(LCD_HttpPanel(2,current-11)==0);entered++;}
+  }
+  assert(current==0&&entered==6);
+ }
+ puts("PASS: two 33-port screens, native clipped text, scrollbar/content drag, endpoints, no idle redraw, PWM 0/100 to port 21, settings press/release/cancel without writes/navigation; preview frames.");
+}
+'''
+C += '\n' + re.search(r'const HTTP_SettingPage \*HTTP_LCDFormRoute.*?\n}', (ROOT/'Application/HTTP/http_lcd_forms.inc').read_text(), re.S)[0] + '\n'
+C += '\n' + re.search(r'int SCREEN_NavigationNext\s*\(.*?\n}', (ROOT/'Application/LCD/Screens/SCREEN_Navigation.c').read_text(), re.S)[0] + '\n'
+def glyph_header():
+ widths=[];offsets=[];heights=[];pixels=bytearray()
+ for size in [16,21,27,24,35]:
+  font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/'+'DejaVuSans.ttf',size-3)
+  ws=[];offs=[];heights.append(size)
+  for c in range(256):
+   w=max(1,int(font.getlength(chr(c))+.5));ws.append(w);offs.append(len(pixels));im=Image.new('L',(w,size));from PIL import ImageDraw
+   ImageDraw.Draw(im).text((0,-2),chr(c),font=font,fill=255);pixels.extend(im.tobytes())
+  widths.append(ws);offsets.append(offs)
+ def arr(a):return '{'+','.join(map(str,a))+'}'
+ return 'static const unsigned char glyphs[]='+arr(pixels)+';\nstatic const int glyph_height[]='+arr(heights)+';\nstatic const int glyph_width[5][256]={' + ','.join(arr(a) for a in widths)+'};\nstatic const unsigned glyph_offset[5][256]={' + ','.join(arr(a) for a in offsets)+'};\n'
+with tempfile.TemporaryDirectory() as d:
+ p=Path(d)
+ for n in ['SCREEN_HttpPanels.c','SCREEN_HttpPanels.h','lpc_thermometer_panel.inc','lcd_port_forms.inc']:shutil.copy(ROOT/'Application/LCD/Screens'/n,p/n)
+ shutil.copy(ROOT/'Application/HTTP/http_lcd_panels.h',p/'http_lcd_panels.h')
+ shutil.copy(ROOT/'Application/LPC2148/http_lpc_panel.h',p/'http_lpc_panel.h')
+ for n in ['http_lcd_forms.h','http_settings_model.h','http_settings_catalog.h']:shutil.copy(ROOT/'Application/HTTP'/n,p/n)
+ (p/'LCD_SensorThresholds.h').write_text('enum{LCD_THRESH_UPDATE=0,LCD_THRESH_ENTER=1,LCD_THRESH_EXIT=2,LCD_THRESH_BACK=2};extern unsigned lcdThresholdPort,lcdThresholdHumidity;int LCD_SensorThresholds(uint8_t);')
+ (p/'SCREEN_Navigation.h').write_text('void SCREEN_NavigationRestore(void);void SCREEN_NavigationEnter(uint32_t,int);')
+ (p/'support.h').write_text(SUPPORT)
+ keyboard_ast=ast.parse((ROOT/'tests/lcd_sensor_thresholds_test.py').read_text())
+ keyboard_resources=ast.literal_eval(next(n.value for n in keyboard_ast.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='resources' for t in n.targets)))
+ (p/'Keyboard.h').write_text(keyboard_resources['Keyboard.h'].replace('test_support.h','support.h'))
+ for n in ['SCREEN_ReadPanel.h','LCD_BasicGraphics.h','LCD_fonts_images.h','LCD_Hardware.h','touch.h']:(p/n).write_text('#include "support.h"\n')
+ (p/'SCREEN_TemperaturePk.h').write_text('enum{LCD_TEMP_UPDATE=0,LCD_TEMP_ENTER=1,LCD_TEMP_EXIT=2};\n')
+ (p/'wwwPages.h').write_text(mode)
+ (p/'test.c').write_text(glyph_header()+'\n'+C)
+ subprocess.run(['gcc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I'+d,str(p/'test.c'),str(ROOT/'Application/HTTP/http_settings_catalog.c'),'-lm','-o',str(p/'test')],check=True)
+ target=ROOT/'Debug/cloud/http-lcd-previews';target.mkdir(parents=True,exist_ok=True)
+ env=dict(os.environ,PREVIEW_DIR=str(target));subprocess.run([str(p/'test')],env=env,check=True)
+ for ppm in target.glob('*.ppm'):
+  Image.open(ppm).save(ppm.with_suffix('.png'))
+ print('Previews:',target)
