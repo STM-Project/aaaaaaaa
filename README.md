@@ -9,15 +9,21 @@ obsługujący pasywny odbiór TCP (`AT+CIPRECVMODE=1`, `AT+CIPRECVLEN?`,
 
 ## Budowanie i pierwsze wgranie
 
-1. Zainstaluj GNU Arm Embedded Toolchain dla Cortex-M7 z Newlib Nano, GNU Make
-   oraz Python 3. Dodaj narzędzia `arm-none-eabi-*` do `PATH`.
-2. W katalogu projektu wykonaj `make -j4`. Projekt można także otworzyć w
-   STM32CubeIDE jako istniejący projekt Makefile, wskazując ten katalog.
+1. W STM32CubeIDE wybierz **File → Import → General → Existing Projects
+   into Workspace**. Wskaż ten katalog i zaimportuj `STM32H753_BOOT_ESP`.
+   Do kroku przed kompilacją potrzebny jest Python 3 dostępny jako `python`
+   w `PATH` środowiska IDE.
+2. Wybierz **Debug** lub **Release** i kliknij **Build Project**.
+   IDE używa własnego kompilatora ARM i generuje
+   `STM32H753_BOOT_ESP.elf`, `.hex` i `.bin` w katalogu konfiguracji.
+   Możesz również zbudować projekt poza IDE poleceniem `make -j4` z GNU Make,
+   GNU Arm Embedded Toolchain z Newlib Nano i Pythonem 3.
 3. Przy pierwszej kompilacji generator zapisze losowe hasło do lokalnego pliku
    `wifi-password`. Zachowaj je. Aby ustawić własne, zapisz przed kompilacją
    od 12 do 63 znaków z zakresu liter, cyfr, myślnika i podkreślenia.
-4. W STM32CubeProgrammer wgraj przez ST-LINK plik `build/bootloader.hex`.
-   Dla surowego `build/bootloader.bin` podaj adres `0x08000000`.
+4. W STM32CubeProgrammer wgraj przez ST-LINK plik HEX z IDE
+   lub `build/bootloader.hex` po kompilacji przez Makefile.
+   Dla surowego BIN podaj adres `0x08000000`.
    Projekt zakłada domyślną kolejność banków Flash i start wewnętrznego Flash.
    Jeśli na płycie istnieje aplikacja pod `0x08000000`, zastąp ją wariantem
    relokowanym opisanym poniżej.
