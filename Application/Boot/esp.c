@@ -219,7 +219,7 @@ bool esp_start(const H753_BootRequest *request, const char *recovery_password)
            command("AT+CIPDINFO=0\r\n") &&
            command("AT+CIPRECVMODE=1\r\n") &&
            command("AT+CIPSERVERMAXCONN=1\r\n") &&
-           command(server) && command("AT+CIPSTO=10\r\n"))) {
+           command(server) && command("AT+CIPSTO=60\r\n"))) {
         boot_debug("Blad konfiguracji serwera HTTP.");
         return false;
     }

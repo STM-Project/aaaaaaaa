@@ -1,5 +1,4 @@
 #include "boot_lcd.h"
-#include "fmc.h"
 #include "debug_uart.h"
 #include "ltdc.h"
 #include "rng.h"
@@ -12,8 +11,14 @@ enum {
     WIDTH = 800, HEIGHT = 480, LOG_ROWS = 11, LOG_COLUMNS = 62,
     LOG_Y = 242, LOG_LINE_HEIGHT = 20
 };
-static uint8_t framebuffer[WIDTH * HEIGHT * 3]
+/* The existing linker reserves the application's RGB888 SDRAM region.
+ * Keep the reservation for its linker assertion. LTDC reads the L8 AXI buffer. */
+static uint8_t unused_sdram_reservation[WIDTH * HEIGHT * 3]
     __attribute__((section(".lcd_framebuffer"), aligned(32), used));
+static uint8_t framebuffer[WIDTH * HEIGHT] __attribute__((aligned(32)));
+
+enum lcd_color { BACKGROUND, CONSOLE, TEXT, TRACK, PROGRESS };
+static const uint32_t palette[] = {0x112134, 0x0b1828, 0xf2f5fa, 0x293e58, 0x368cd1};
 static bool ready;
 static char log_rows[LOG_ROWS][LOG_COLUMNS + 1];
 static unsigned log_next, log_count;
@@ -41,16 +46,10 @@ static const uint8_t digits[10][7] = {
 };
 static const uint8_t percent_glyph[7] = {17,2,4,8,17,0,0};
 
-static void rectangle(unsigned x, unsigned y, unsigned width, unsigned height, uint32_t rgb)
+static void rectangle(unsigned x, unsigned y, unsigned width, unsigned height, enum lcd_color color)
 {
-    for (unsigned row = y; row < y + height; ++row) {
-        uint8_t *p = framebuffer + (row * WIDTH + x) * 3;
-        for (unsigned col = 0; col < width; ++col) {
-            *p++ = (uint8_t)rgb;
-            *p++ = (uint8_t)(rgb >> 8);
-            *p++ = (uint8_t)(rgb >> 16);
-        }
-    }
+    for (unsigned row = y; row < y + height; ++row)
+        memset(framebuffer + row * WIDTH + x, color, width);
 }
 
 static void label(unsigned x, unsigned y, unsigned scale, const char *text)
@@ -81,58 +80,44 @@ static void label(unsigned x, unsigned y, unsigned scale, const char *text)
             for (unsigned row = 0; row < 7; ++row)
                 for (unsigned col = 0; col < 5; ++col)
                     if (bits[row] & (16u >> col))
-                        rectangle(x + col * scale, y + row * scale, scale, scale, 0xf2f5fa);
+                        rectangle(x + col * scale, y + row * scale, scale, scale, TEXT);
     }
 }
 
-static bool sdram_command(uint32_t mode, uint32_t count, uint32_t register_value)
+static bool start_ltdc(void)
 {
-    FMC_SDRAM_CommandTypeDef cmd = {.CommandMode = mode,
-                                    .CommandTarget = FMC_SDRAM_CMD_TARGET_BANK1,
-                                    .AutoRefreshNumber = count,
-                                    .ModeRegisterDefinition = register_value};
-    return HAL_SDRAM_SendCommand(&hsdram1, &cmd, 100) == HAL_OK;
-}
-
-static bool framebuffer_init(void)
-{
-    /* Board timing from MX_FMC_Init. Skip the application's full 16 MiB test. */
-    hsdram1.Instance = FMC_SDRAM_DEVICE;
-    hsdram1.Init = (FMC_SDRAM_InitTypeDef){
-        .SDBank = FMC_SDRAM_BANK1, .ColumnBitsNumber = FMC_SDRAM_COLUMN_BITS_NUM_8,
-        .RowBitsNumber = FMC_SDRAM_ROW_BITS_NUM_12, .MemoryDataWidth = FMC_SDRAM_MEM_BUS_WIDTH_32,
-        .InternalBankNumber = FMC_SDRAM_INTERN_BANKS_NUM_4, .CASLatency = FMC_SDRAM_CAS_LATENCY_2,
-        .WriteProtection = FMC_SDRAM_WRITE_PROTECTION_DISABLE,
-        .SDClockPeriod = FMC_SDRAM_CLOCK_PERIOD_2, .ReadBurst = FMC_SDRAM_RBURST_ENABLE,
-        .ReadPipeDelay = FMC_SDRAM_RPIPE_DELAY_1
+    /* The panel timing is identical to MX_LTDC_Init. HAL_LTDC_MspInit
+     * supplies the project's PLL3 pixel clock and GPIO pin mapping. */
+    hltdc.Instance = LTDC;
+    hltdc.Init = (LTDC_InitTypeDef){
+        .HSPolarity = LTDC_HSPOLARITY_AL, .VSPolarity = LTDC_VSPOLARITY_AL,
+        .DEPolarity = LTDC_DEPOLARITY_AL, .PCPolarity = LTDC_PCPOLARITY_IPC,
+        .HorizontalSync = 38, .VerticalSync = 2,
+        .AccumulatedHBP = 45, .AccumulatedVBP = 4,
+        .AccumulatedActiveW = 845, .AccumulatedActiveH = 484,
+        .TotalWidth = 851, .TotalHeigh = 486
     };
-    FMC_SDRAM_TimingTypeDef timing = {.LoadToActiveDelay = 2, .ExitSelfRefreshDelay = 7,
-        .SelfRefreshTime = 5, .RowCycleDelay = 7, .WriteRecoveryTime = 3,
-        .RPDelay = 2, .RCDDelay = 2};
-    if (HAL_SDRAM_Init(&hsdram1, &timing) != HAL_OK)
+    LTDC_LayerCfgTypeDef layer = {
+        .WindowX0 = 0, .WindowX1 = WIDTH, .WindowY0 = 0, .WindowY1 = HEIGHT,
+        .PixelFormat = LTDC_PIXEL_FORMAT_L8, .Alpha = 255,
+        .BlendingFactor1 = LTDC_BLENDING_FACTOR1_PAxCA,
+        .BlendingFactor2 = LTDC_BLENDING_FACTOR2_PAxCA,
+        .FBStartAdress = (uint32_t)(uintptr_t)framebuffer,
+        .ImageWidth = WIDTH, .ImageHeight = HEIGHT
+    };
+    if (HAL_LTDC_Init(&hltdc) != HAL_OK)
         return false;
-    HAL_SetFMCMemorySwappingConfig(FMC_SWAPBMAP_SDRAM_SRAM);
-    if (!sdram_command(FMC_SDRAM_CMD_CLK_ENABLE, 1, 0))
-        return false;
-    HAL_Delay(1);
-    if (!sdram_command(FMC_SDRAM_CMD_PALL, 1, 0) ||
-        !sdram_command(FMC_SDRAM_CMD_AUTOREFRESH_MODE, 8, 0) ||
-        !sdram_command(FMC_SDRAM_CMD_LOAD_MODE, 1, 0x0222) ||
-        HAL_SDRAM_ProgramRefreshRate(&hsdram1, 1542) != HAL_OK)
-        return false;
-
-    volatile uint8_t *probe = framebuffer;
-    probe[0] = 0x5a;
-    probe[sizeof framebuffer - 1] = 0xa5;
-    __DSB();
-    return probe[0] == 0x5a && probe[sizeof framebuffer - 1] == 0xa5;
+    __HAL_LTDC_DISABLE_IT(&hltdc, LTDC_IT_TE | LTDC_IT_FU);
+    return HAL_LTDC_ConfigLayer(&hltdc, &layer, 0) == HAL_OK &&
+           HAL_LTDC_ConfigCLUT(&hltdc, palette, sizeof palette / sizeof *palette, 0) == HAL_OK &&
+           HAL_LTDC_EnableCLUT(&hltdc, 0) == HAL_OK;
 }
 
 static void paint_log(void)
 {
     if (!ready)
         return;
-    rectangle(16, LOG_Y, WIDTH - 32, LOG_ROWS * LOG_LINE_HEIGHT, 0x0b1828);
+    rectangle(16, LOG_Y, WIDTH - 32, LOG_ROWS * LOG_LINE_HEIGHT, CONSOLE);
     unsigned first = (log_next + LOG_ROWS - log_count) % LOG_ROWS;
     for (unsigned i = 0; i < log_count; ++i)
         label(24, LOG_Y + 3 + i * LOG_LINE_HEIGHT, 2, log_rows[(first + i) % LOG_ROWS]);
@@ -157,21 +142,19 @@ void boot_lcd_log(const char *message)
 
 void boot_lcd_init(void)
 {
-    boot_debug("LCD: inicjalizacja SDRAM.");
-    if (!framebuffer_init()) {
-        boot_debug("LCD: blad SDRAM.");
-        return;
-    }
-
-    rectangle(0, 0, WIDTH, HEIGHT, 0x112134);
+    boot_debug("LCD: bufor AXI SRAM, format L8.");
+    rectangle(0, 0, WIDTH, HEIGHT, BACKGROUND);
     label(24, 25, 4, "AKTUALIZACJA H7");
     label(24, 213, 2, "LOG BOOTLOADERA");
     boot_debug("LCD: start LTDC.");
     __DSB();
-    MX_LTDC_Init();
+    if (!start_ltdc()) {
+        boot_debug("LCD: blad konfiguracji LTDC.");
+        return;
+    }
     ready = true;
     boot_lcd_status("START BOOTLOADERA", 0);
-    boot_debug("LCD gotowy.");
+    boot_debug("LCD gotowy: LTDC korzysta z AXI SRAM.");
 }
 
 void boot_lcd_status(const char *status, unsigned percent)
@@ -179,17 +162,17 @@ void boot_lcd_status(const char *status, unsigned percent)
     if (!ready || (last_status == status && last_percent == percent))
         return;
     if (last_status != status) {
-        rectangle(24, 75, WIDTH - 48, 32, 0x112134);
-        rectangle(24, 153, WIDTH - 48, 53, 0x112134);
+        rectangle(24, 75, WIDTH - 48, 32, BACKGROUND);
+        rectangle(24, 153, WIDTH - 48, 53, BACKGROUND);
         label(24, 75, 4, status);
     }
     last_status = status;
     last_percent = percent;
-    rectangle(24, 118, 622, 20, 0x293e58);
-    rectangle(24, 118, 622u * percent / 100u, 20, 0x368cd1);
+    rectangle(24, 118, 622, 20, TRACK);
+    rectangle(24, 118, 622u * percent / 100u, 20, PROGRESS);
     char value[8];
     snprintf(value, sizeof value, "%u%%", percent);
-    rectangle(672, 116, 92, 24, 0x112134);
+    rectangle(672, 116, 92, 24, BACKGROUND);
     label(672, 116, 3, value);
     __DSB();
 }

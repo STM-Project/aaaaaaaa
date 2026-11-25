@@ -29,6 +29,11 @@ void Boot_Main(void)
     boot_debug(requested ? "Przyjeto zadanie /upload. Tryb STA."
                          : "Brak poprawnej aplikacji. Tryb serwisowy AP.");
     boot_lcd_init();
+    boot_debug("SDRAM: inicjalizacja przed ESP32.");
+    if (boot_sdram_init())
+        boot_debug("SDRAM gotowy.");
+    else
+        boot_debug("SDRAM: blad; LCD pozostaje w AXI SRAM.");
     /* Give LTDC time to show the title before starting ESP32. */
     boot_delay(100);
     char recovery_password[17] = {0};

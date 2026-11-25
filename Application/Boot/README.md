@@ -12,7 +12,9 @@ przekazanego profilu sieci. Jeżeli brak poprawnej aplikacji, połącz się
 z siecią `STM32H753-Boot` i otwórz `http://192.168.4.1/upload`. Hasło
 tej sieci jest losowane przy starcie i wyświetlane na LCD.
 
-Przeglądarka pokazuje postęp przesyłania pliku. LCD pokazuje postęp
+Przeglądarka wysyła BIN w porcjach do 16 KiB i pokazuje postęp po
+potwierdzeniu zapisu każdej porcji przez STM32. Przerwany transfer porcji
+jest ponawiany automatycznie. LCD pokazuje postęp
 odbioru i zapisu we Flash, weryfikację CRC oraz wynik. Po udanym
 zapisie STM32 wykonuje reset i uruchamia aplikację.
 
@@ -38,3 +40,9 @@ konfigurację, wybierz dołączony plik `.launch` z tego projektu.
 Aplikacja główna i bootloader mają tę samą nazwę projektu Eclipse.
 Jeśli otwierasz oba w CubeIDE, użyj dwóch workspace'ów i wybierz profil
 Debug w workspace bootloadera.
+
+
+LCD bootloadera korzysta z bufora L8 w wewnętrznej pamięci AXI SRAM.
+Przed uruchomieniem ESP32 bootloader inicjalizuje również zewnętrzną SDRAM
+i raportuje wynik testu na LCD oraz przez UART7. Błąd zapisu/odczytu SDRAM
+nie blokuje wyświetlania logu i przesyłania aktualizacji.

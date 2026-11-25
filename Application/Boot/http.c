@@ -1,5 +1,6 @@
 #include "http.h"
 #include "boot_lcd.h"
+#include "debug_uart.h"
 #include "esp.h"
 #include "image.h"
 
@@ -8,6 +9,7 @@
 #include <strings.h>
 
 #define REQUEST_TIMEOUT_MS 15000u
+#define UPLOAD_CHUNK_BYTES 16384u
 
 static const char upload_page[] =
     "<!doctype html><html lang=pl><meta charset=utf-8>"
@@ -32,22 +34,32 @@ static const char upload_page[] =
     "c^=b;for(let k=0;k<8;k++)c=(c>>>1)^((c&1)?0xedb88320:0);}"
     "const crc=((~c)>>>0).toString(16).padStart(8,'0');"
     "const progress=document.getElementById('progress');progress.value=0;"
-    "status.textContent='Przesylanie pliku.';"
-    "const r=new XMLHttpRequest();r.open('POST','/uploader.php?crc='+crc);"
-    "r.setRequestHeader('Content-Type','application/octet-stream');"
-    "r.setRequestHeader('X-H753-Update-Key',key.value);"
-    "r.upload.onprogress=e=>{if(e.lengthComputable)progress.value=Math.floor(e.loaded*100/e.total);};"
-    "r.upload.onload=()=>{status.textContent='Zapis i weryfikacja w STM32.';};"
-    "await new Promise((ok,fail)=>{r.onload=ok;r.onerror=fail;r.onabort=fail;r.send(f);});"
-    "status.textContent=r.responseText;"
-    "}catch(e){status.textContent='Utracono polaczenie. Sprawdz, czy aplikacja wystartowala.';}"
+    "let offset=0;while(offset<f.size){"
+    "const end=Math.min(f.size,offset+16384);"
+    "const url='/uploader.php?crc='+crc+'&size='+f.size+'&offset='+offset;"
+    "let reply;for(let attempt=0;attempt<4;attempt++){"
+    "try{const headers={'Content-Type':'application/octet-stream','X-H753-Update-Key':key.value};"
+    "const r=await fetch(url,{method:'POST',headers,body:f.slice(offset,end),"
+    "signal:AbortSignal.timeout(45000)});"
+    "reply={ok:r.ok,status:r.status,text:await r.text()};"
+    "if(r.status!==408)break;"
+    "}catch(e){reply=undefined;}"
+    "status.textContent='Ponawiam porcje od '+offset+' B.';"
+    "await new Promise(r=>setTimeout(r,750));}"
+    "if(!reply)throw new Error('Utracono polaczenie przy '+offset+' B.');"
+    "if(!reply.ok)throw new Error(reply.text);"
+    "if(reply.text.trim()!==String(end))throw new Error('Brak potwierdzenia zapisu STM32.');"
+    "offset=end;progress.value=Math.floor(offset*100/f.size);"
+    "status.textContent='Potwierdzono '+offset+' / '+f.size+' B.';}"
+    "status.textContent='Firmware zapisany. Uruchamiam aplikacje.';"
+    "}catch(e){status.textContent=e.message;}"
     "finally{send.disabled=false;}};"
     "</script></html>";
 
 struct request {
     bool upload;
     uint32_t length;
-    uint32_t crc;
+    uint32_t crc, image_size, image_offset;
     const char *candidate;
 };
 
@@ -85,6 +97,30 @@ static bool parse_crc(const char *text, uint32_t *crc)
     return true;
 }
 
+static bool parse_upload_target(char *target, struct request *request)
+{
+    static const char upload_route[] = "/uploader.php?crc=";
+    if (strncmp(target, upload_route, sizeof upload_route - 1))
+        return false;
+    char *crc = target + sizeof upload_route - 1;
+    char *size = strchr(crc, '&');
+    if (!size)
+        return parse_crc(crc, &request->crc);
+    if (strncmp(size, "&size=", 6))
+        return false;
+    *size = 0;
+    size += 6;
+    char *offset = strchr(size, '&');
+    if (!offset || strncmp(offset, "&offset=", 8))
+        return false;
+    *offset = 0;
+    return parse_crc(crc, &request->crc) &&
+           parse_length(size, &request->image_size) &&
+           request->image_size >= FLASH_WORD_BYTES &&
+           parse_length(offset + 8, &request->image_offset) &&
+           request->image_offset < request->image_size;
+}
+
 static bool parse_request(char *head, struct request *request)
 {
     char *line = strstr(head, "\r\n");
@@ -104,9 +140,7 @@ static bool parse_request(char *head, struct request *request)
     if (strcmp(head, "GET") == 0)
         return strcmp(target, "/") == 0 || strcmp(target, "/upload") == 0 || strcmp(target, "/ulpad") == 0;
 
-    static const char upload_route[] = "/uploader.php?crc=";
-    if (strcmp(head, "POST") || strncmp(target, upload_route, sizeof upload_route - 1) ||
-        !parse_crc(target + sizeof upload_route - 1, &request->crc))
+    if (strcmp(head, "POST") || !parse_upload_target(target, request))
         return false;
 
     bool has_length = false, has_type = false;
@@ -144,7 +178,11 @@ static bool parse_request(char *head, struct request *request)
         }
         line = next + 2;
     }
-    request->upload = has_length && has_type && request->length >= FLASH_WORD_BYTES;
+    request->upload = has_length && has_type &&
+        (request->image_size ? request->length &&
+                               request->length <= UPLOAD_CHUNK_BYTES &&
+                               request->length <= request->image_size - request->image_offset
+                             : request->length >= FLASH_WORD_BYTES);
     return request->upload;
 }
 
@@ -177,6 +215,78 @@ static int next_data(unsigned link, uint8_t *buffer, size_t capacity)
         boot_delay(20);
     } while ((int32_t)(boot_millis() - deadline) < 0);
     return -1;
+}
+
+/* Buffer a complete request before programming Flash. This lets a client
+ * repeat the same offset after the connection closes during receive. */
+static enum http_result serve_chunk(unsigned link, const struct request *request,
+                                    const uint8_t *initial, size_t received)
+{
+    static uint8_t chunk[UPLOAD_CHUNK_BYTES];
+    static struct image_writer transfer;
+    static uint32_t previous_offset, previous_length;
+    static bool active;
+
+    if (received > request->length) {
+        respond(link, "400 Bad Request", "text/plain", "Niepoprawna dlugosc porcji.\n");
+        return HTTP_OTHER;
+    }
+    memcpy(chunk, initial, received);
+    while (received < request->length) {
+        size_t wanted = request->length - received;
+        if (wanted > 1024u)
+            wanted = 1024u;
+        int count = next_data(link, chunk + received, wanted);
+        if (count < 0) {
+            boot_debug("HTTP: przerwano odbior porcji. Mozna ponowic.");
+            respond(link, "408 Request Timeout", "text/plain", "Ponow przesylanie porcji.\n");
+            return HTTP_OTHER;
+        }
+        received += (size_t)count;
+    }
+
+    bool same_image = active && request->image_size == transfer.length &&
+                      request->crc == transfer.expected_crc;
+    bool repeated = same_image && transfer.received != 0 &&
+                    request->image_offset == previous_offset &&
+                    request->length == previous_length;
+    if (!repeated) {
+        if (request->image_offset == 0) {
+            active = image_begin(&transfer, request->image_size, request->crc);
+            boot_lcd_status("ZAPIS OPROGRAMOWANIA", 0);
+            boot_debug("HTTP: rozpoczecie zapisu aplikacji.");
+        } else if (!same_image || request->image_offset != transfer.received) {
+            respond(link, "409 Conflict", "text/plain", "Niezgodny offset. Uruchom wgrywanie od poczatku.\n");
+            return HTTP_OTHER;
+        }
+        if (!active || !image_write(&transfer, chunk, received))
+            goto failed;
+        previous_offset = request->image_offset;
+        previous_length = request->length;
+    }
+
+    bool complete = transfer.received == transfer.length;
+    if (complete) {
+        boot_lcd_status("WERYFIKACJA", 99);
+        if (!image_finish(&transfer))
+            goto failed;
+        active = false;
+        boot_lcd_status("ZAPISANO START H7", 100);
+    } else {
+        boot_lcd_status("ZAPIS OPROGRAMOWANIA", transfer.received * 100u / transfer.length);
+    }
+    char ack[16];
+    snprintf(ack, sizeof ack, "%u\n", (unsigned)transfer.received);
+    respond(link, "200 OK", "text/plain", ack);
+    return complete ? HTTP_INSTALLED : HTTP_OTHER;
+
+failed:
+    active = false;
+    boot_debug("HTTP: blad zapisu lub weryfikacji obrazu.");
+    boot_lcd_status("BLAD AKTUALIZACJI", 0);
+    respond(link, "422 Unprocessable Content", "text/plain",
+            "Wgrywanie nieudane. Sprawdz plik H753 i sume CRC.\n");
+    return HTTP_OTHER;
 }
 
 enum http_result http_serve(unsigned link, const char *update_key)
@@ -215,6 +325,10 @@ enum http_result http_serve(unsigned link, const char *update_key)
                            !H753_UpdateKeyMatches(update_key, request.candidate,
                                                  strlen(request.candidate)))) {
             respond(link, "403 Forbidden", "text/plain", "Niepoprawny klucz aktualizacji.\n");
+            break;
+        }
+        if (request.image_size) {
+            result = serve_chunk(link, &request, bytes + offset, (size_t)count - offset);
             break;
         }
         boot_lcd_status("ZAPIS OPROGRAMOWANIA", 0);
