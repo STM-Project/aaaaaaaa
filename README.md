@@ -7,6 +7,16 @@ Sygnał EN modułu ESP32 jest na PA9. Do uruchomienia potrzebny jest ESP-AT
 obsługujący pasywny odbiór TCP (`AT+CIPRECVMODE=1`, `AT+CIPRECVLEN?`,
 `AT+CIPRECVDATA`). Obsługiwane są początkowe prędkości 115200 i 2000000 bodów.
 
+## Pliki z głównego H7
+
+`H7-original/` przechowuje kopię plików projektu głównego z pominięciem
+własnych źródeł C, nagłówków i plików INC niezwiązanych z bootloaderem.
+Importuj projekt z katalogu głównego repozytorium. Jeśli IDE pokaże również
+projekt z `H7-original/`, wybierz wyłącznie `STM32H753_BOOT_ESP`.
+Katalog z kopią jest wyłączony z konfiguracji Debug i Release.
+Tablica wektorów bootloadera ma offset `0` względem początku Flash
+i znajduje się pod `0x08000000`.
+
 ## Budowanie i pierwsze wgranie
 
 1. W STM32CubeIDE wybierz **File → Import → General → Existing Projects

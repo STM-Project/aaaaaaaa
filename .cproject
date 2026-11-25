@@ -87,7 +87,7 @@
 						</toolChain>
 					</folderInfo>
 					<sourceEntries>
-						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="" excluding="Debug|Release|build|tests" />
+						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="" excluding="Debug|Release|build|tests|H7-original" />
 					</sourceEntries>
 				</configuration>
 			</storageModule>
@@ -174,7 +174,7 @@
 						</toolChain>
 					</folderInfo>
 					<sourceEntries>
-						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="" excluding="Debug|Release|build|tests" />
+						<entry flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name="" excluding="Debug|Release|build|tests|H7-original" />
 					</sourceEntries>
 				</configuration>
 			</storageModule>

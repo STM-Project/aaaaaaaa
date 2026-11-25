@@ -1,0 +1,217 @@
+1-----------------MPU-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		 
+	
+	 Write-Back: 		CPU zapisuje dane tylko do cache (nie czeka na wolny SDRAM).	
+	 Write-Through: 	Każdy zapis procesora trafia jednocześnie do cache i do fizycznego SDRAM.	
+	 Write-Allocate: 	Jeśli zapisujesz coś pod nowy adres, procesor najpierw ładuje całą linię z RAM do cache. Dzięki temu kolejne operacje na tym obszarze (np. pętla for) działają z prędkością procesora (setki MHz), a nie pamięci zewnętrznej (często tylko 100-200 MHz).	
+Brak Write-Allocate: 	Zapis pod nowy adres nie powoduje wciągnięcia linii do cache.	
+
+1. TEX Level 1 + Cacheable + Bufferable (C=1, B=1)		-> Jest to tryb Write-Back + Write-Allocate.	
+	- Zapis pod nowy adres: Jeśli procesor chce zapisać dane do SDRAM (a nie ma ich w cache), najpierw pobiera całą linię (32 bajty) z SDRAM do cache, a następnie wykonuje w nim zmianę.
+ 	- Zaleta: Gigantyczny wzrost wydajności w pętlach modyfikujących dane. Skoro cała linia jest już w cache, kolejne 31 zapisów (bajtów) odbędzie się z pełną prędkością procesora (400-480 MHz), a nie z prędkością szyny SDRAM (100-200 MHz).
+ 	- Wada:   Każdy zapis "zaśmieca" cache, wypychając z niego inne potencjalnie potrzebne dane.
+ 	- Zastosowanie: Przetwarzanie sygnałów, skomplikowane algorytmy, duże struktury danych.
+ 	- Cena: Musisz ręcznie używać SCB_CleanDCache_by_Addr() przed każdym startem DMA z tego obszaru.
+ 	
+2. TEX Level 0 + Cacheable + Bufferable (C=1, B=1)		-> Jest to tryb Write-Back + No Write-Allocate.
+	- Zapis pod nowy adres: Jeśli procesor chce zapisać dane (a nie ma ich w cache), zapisuje je bezpośrednio do SDRAM (omijając cache). Linia w cache zostanie utworzona dopiero wtedy, gdy najpierw wykonasz odczyt z tego adresu.
+	- Zaleta: Nie "zatyka" cache'u danymi, których tylko raz używasz do zapisu (np. kopiowanie dużego bloku danych). Oszczędza miejsce w L1 Cache dla ważniejszych zmiennych
+	- Wada: Znacznie wolniejsze operacje zapisu w pętlach, ponieważ każdy zapis musi fizycznie przejść przez powolną magistralę do SDRAM.
+	- Zastosowanie: Duże bufory, stałe, rzadkie zapisy
+
+3. TEX Level 1 + C=1 + B=0 		->		(Write-Through,  Brak Write-Allocate)
+	- Zaleta: Masz pewność, że SDRAM jest zawsze aktualny. Nie musisz używać SCB_CleanDCache() przed startem DMA.
+	- Zastosowanie: SDRAM przechowuje obraz wyświetlany na ekranie (np. przez LTDC).
+	
+4. TEX Level 0 + C=1 + B=0 		->		(Write-Through,  Brak Write-Allocate)
+	- Jest to jedno z najbezpieczniejszych ustawień dla SDRAM, gdy zależy Ci na wydajności odczytu, ale chcesz uniknąć problemów z DMA przy zapisie. Procesor czeka (przez Write Buffer), aż dane zostaną fizycznie wysłane na magistralę do SDRAM
+	- Każda instrukcja zapisu jest ograniczona prędkością szyny FMC.
+	
+TEX Level 1  ->  to pamięć jest typu "Normal Memory" z możliwością bardziej agresywnego spekulatywnego odczytu (procesor może sam z wyprzedzeniem pobrać dane do cache, zanim Twój kod o nie poprosi)
+TEX Level 0  ->  to pamięć najbardziej przewidywalna.	
+
+Włączona  (BUFFERABLE): 	Procesor "wysyła" dane do zapisu i natychmiast przechodzi do kolejnej instrukcji, nie czekając, aż dane fizycznie dotrą do RAM. Kontroler pamięci zajmie się tym w tle.
+Wyłączona (NOT_BUFFERABLE): Procesor czeka (robi "stall"), aż dane fizycznie znajdą się w pamięci RAM.
+
+Dla Fatfs:	(buff musi byc wyrównany do linii cache (32 bajty))
+	Jeśli ustawisz BUFFERABLE, Twój kod może wywołać funkcję f_write, a zaraz po niej uruchomić DMA.
+	Istnieje szansa, że DMA zacznie czytać z RAM, zanim bufor zapisu procesora zdąży tam fizycznie "wypchnąć" ostatnie bajty.
+	A jesli nie to Efekt: DMA wyśle na kartę SD stare dane, co doprowadzi do uszkodzenia plików lub błędu FR_INT_ERR.
+
+Zasada ogólna:
+	Przed uruchomieniem funkcji zapisu DMA stosuj 		SCB_CleanDCache_by_Addr() 		aby wszystkie dane z casha wypchnac na zewnatrz (do RAM, SDRAM zeby te pamieci mialy prawdziwe dane).
+	Zaraz po uruchomieniu funkcji odczytu DMA stosuj	SCB_InvalidateDCache_by_Addr() 	aby wyczyscic cashe i miec w niej aktualne dane z DMA, (wymuszając na CPU pobranie ich bezpośrednio z RAM, SDRAM... przy następnej próbie dostępu).
+
+Ciekawe (osobliwe) rozwiazanie w SD_write() dla ENABLE_SCRATCH_BUFFER mamy:
+{
+	SCB_InvalidateDCache_by_Addr((uint32_t*)scratch, BLOCKSIZE); 
+	memcpy((void *)scratch, buff, BLOCKSIZE);
+	ret = BSP_SD_WriteBlocks_DMA((uint32_t*)scratch, (uint32_t)sector++, 1);
+}
+
+
+2-----------ALIGN--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		
+
+Wyrównanie buforów do 32 bajtów jest wymagane głównie w mikrokontrolerach z rdzeniem Cortex-M7 (np. serie STM32H7, STM32F7), gdy masz włączoną pamięć podręczną danych (D-Cache)
+Operacje na cache (SCB_CleanDCache_by_Addr, SCB_InvalidateDCache_by_Addr) działają na całych liniach. Jeśli bufor nie jest wyrównany do 32 bajtów i jego rozmiar nie jest wielokrotnością 32, operacja na cache może przypadkowo nadpisać lub usunąć inne dane znajdujące się w tej samej linii.	
+	
+Praca z peryferiami o dużej przepustowości:
+Wyrównanie do 32 bajtów jest standardem przy obsłudze:
+ - Ethernetu: 			Bufory ramek sieciowych muszą być wyrównane, aby uniknąć błędów przy współpracy z D-Cache.
+ - SDMMC (karty SD): 	Transfery blokowe często wymagają wyrównania dla poprawnego działania DMA i spójności danych.
+ - Wyświetlaczy (LTDC): Bufory ramek obrazu są bardzo duże i ich wyrównanie do linii cache znacząco poprawia wydajność odświeżania.
+	
+Niektóre zaawansowane tryby pracy DMA (np. w STM32H7) pozwalają na przesyłanie danych w "paczkach" (bursts). Aby DMA mogło w pełni wykorzystać magistralę i przesyłać dane najszybciej jak to możliwe, adresy buforów powinny być wyrównane do granic tych paczek, co często pokrywa się z wyrównaniem do 32 bajtów
+	
+Zmienne typu uint32_t, int, czy float są automatycznie wyrównywane do 4 bajtów przez kompilator.
+Zmienne typu uint8_t (char) domyślnie są wyrównywane tylko do 1 bajta.
+DMA: Większość kontrolerów DMA w STM32 wymaga, aby adresy (szczególnie przy transferach 32-bitowych) były wyrównane do 4 bajtów.	
+	
+	
+3---------WNIOSKI Z TESTOW SD_CARD------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		
+
+W funkcji SD_read() nalezy dac poprawke: zamioast  'if (!((uint32_t)buff & 0x3))'  dac  'if (!((uint32_t)buff & 0x1F))'	 i dziala dla  MPU_ACCESS_BUFFERABLE.
+Cykl odczytu z pliku i zapisu do nowego pliku jest czasowo takie same dla  MPU_ACCESS_BUFFERABLE  jak i dla  MPU_ACCESS_NOT_BUFFERABLE  (nie ma roznicy).
+	
+	
+4---------MEMORY CPU------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		
+	
+DTCMRAM:  			 Pamięć DTCM (Data Tightly Coupled Memory) jest podłączona bezpośrednio do rdzenia procesora Cortex-M7. Tylko dla procesora (zmienne krytyczne czasowo, stos). Brak dostępu dla DMA1/DMA2.
+
+RAM_D1 (AXI SRAM):	 Jeśli używasz DMA1 lub DMA2 (które zazwyczaj obsługują UARTy), mogą one bez problemu czytać i pisać do pamięci w domenie D1. Sygnał przechodzi wtedy przez specjalny mostek między domenami (Bus Matrix). 
+					 Zaleta: 	AXI SRAM jest największą i bardzo szybką pamięcią w STM32H7.
+					 Wada: 		Mostek między domenami wprowadza minimalne opóźnienie (latency) i obciąża szynę AXI, którą procesor komunikuje się z pamięcią Flash
+					 
+RAM_D2, RAM_D3:	     DMA1, DMA22 i UARTy są w tej samej domenie, co odciąża główną szynę systemową AXI. Jeśli nie brakuje Ci miejsca w SRAM1/2 (domena D2), lepiej trzymać bufory UART właśnie tam.
+					 Dzięki temu "ruch" związany z transmisją danych nie przeszkadza procesorowi w pobieraniu instrukcji i danych z domeny D1
+	
+	
+Adres bazowy regionu ( MPU_InitStruct.BaseAddress = address buffer ) musi być wielokrotnością jego rozmiaru ( MPU_InitStruct.Size = sizeof(buffer) ).
+Jeśli ustawisz MPU_REGION_SIZE_1KB, to adres bufora w pamięci RAM musi być podzielny przez 1024 (np. 0x30000000, 0x30000400, 0x30000800 itd.). Jeśli linker umieści bufor pod adresem np. 0x30000020, MPU nie zadziała prawidłowo dla całego bufora lub zgłosi błąd konfiguracji.
+	
+MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE:   	Stosuje się to głównie w systemach wieloprocesorowych lub przy bardzo specyficznych peryferiach (np. gdyby DMA miało własny cache, co w H7 nie występuje). Wymusza na procesorze zachowanie bardzo ścisłej kolejności operacji (tzw. memory barriers).
+MPU_InitStruct.IsShareable = MPU_ACCESS_NOT_SHAREABLE:  Procesor traktuje pamięć jako swoją własną. Wydajność jest wyższa (brak zbędnej synchronizacji na poziomie szyn sterujących cache'em). 
+	
+	
+		
+4---------INFOs between THREADs or INTERRUPTs ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		
+	
+W systemach RTOS na STM32 (najczęściej FreeRTOS) flagę z przerwania do wątku przesyła się za pomocą mechanizmów synchronizacji, unikając zwykłych zmiennych globalnych, które wymagają nieefektywnego odpytywania (pollingu).	
+	
+1. Direct-to-Task Notifications 
+   - Najszybsza i najefektywniejsza,  ok. 45% szybsze niż semafory binarne, 
+   - Oszczędność pamięci, Nie wymagają tworzenia dodatkowego obiektu w pamięci RAM (takiego jak struktura semafora). Flaga jest przechowywana bezpośrednio w strukturze zadania (TCB)):
+   - wysyła powiadomienie bezpośrednio do konkretnego wątku,  
+   - w przerwaniu uzyj vTaskNotifyGiveFromISR()(bardzo prosta) lub xTaskNotifyFromISR()(bardziej złożona)
+   - w watku 	  użyj ulTaskNotifyTake()	   (bardzo prosta) lub xTaskNotifyWait()   (bardziej złożona), aby przejść w stan uśpienia do czasu otrzymania flagi.
+   - Kiedy NIE używać tej metody:  Tylko wtedy, gdy musisz wysłać flagę do wielu wątków naraz (wtedy użyj Event Groups) lub gdy wielu nadawców musi wysyłać flagi do wielu odbiorców (wtedy użyj kolejek lub semaforów).
+   
+2. Binary Semaphore (Semafor binarny)	
+   - Klasyczne rozwiązanie, gdzie przerwanie(watek) "oddaje" semafor, a wątek na niego czeka     xSemaphoreGiveFromISR(xSemaphore, &pxHigherPriorityTaskWoken),     xSemaphoreTake(xSemaphore, portMAX_DELAY).
+   
+3. Event Groups (Grupy zdarzeń)	
+   - Idealne, gdy wątek musi czekać na kilka różnych flag (bitów)   xEventGroupSetBitsFromISR(),   xEventGroupWaitBits().
+   
+	
+Sufiks _ISR:   Funkcje te są nieblokujące i bezpieczne dla kontekstu przerwania.
+Wymuszenie:    Przełączenia kontekstu: Większość funkcji FromISR posiada parametr pxHigherPriorityTaskWoken. Jeśli zwróci on pdTRUE, należy wywołać portYIELD_FROM_ISR(), aby system natychmiast przełączył się na wybudzony wątek, zamiast czekać do następnego tyknięcia zegara systemowego
+	
+
+5------------- MUTEX  SEMAFOR--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	
+Mutex    to klucz do łazienki: Może go wziąć tylko jedna osoba. Dopóki nie wyjdzie i nie odda klucza, nikt inny nie wejdzie.
+Semafor  to zielone/czerwone światło: Służy do dawania sygnału "teraz twoja kolej", często między przerwaniem sprzętowym a wątkiem.
+
+ - Mechanizm własności (Ownership) – Najważniejsza różnica:
+	Mutex 	 ma właściciela. Jeśli Wątek A pobierze Mutex, system zapisuje, że to Wątek A go kontroluje. Żaden inny wątek ani przerwanie nie może tego Mutexu oddać. Tylko Wątek A ma prawo go zwolnić.Semafor nie ma właściciela. 
+	Semafor  to po prostu licznik (w przypadku binarnego: 0 lub 1). Jeśli Wątek A pobierze semafor (zmniejszy licznik do 0), to Wątek B lub przerwanie sprzętowe może go oddać (zwiększyć do 1).
+
+ - Dziedziczenie priorytetów (Priority Inheritance):
+ 	Mutex 	 posiada ten mechanizm. Zapobiega on zawieszeniu systemu (inwersji priorytetów). Jeśli wątek o niskim priorytecie blokuje Mutex, a wątek o wysokim priorytecie spróbuje go pobrać, system sztucznie i na chwilę podniesie priorytet tego pierwszego, aby jak najszybciej skończył pracę i zwolnił zasób.
+ 	Semafor  nie posiada tego mechanizmu. Jeśli wątek o wysokim priorytecie zablokuje się na semaforze, system nie pomoże wątkowi, który ma ten semafor zwolnić.
+
+Semafory sa binarne albo licznikowe.
+
+
+6------------- VOLATILE --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+	
+Słowo kluczowe volatile informuje kompilator, że wartość danej zmiennej może zmienić się w nieoczekiwany sposób poza aktualnym kontekstem programu, przez co blokuje optymalizacje polegające na zapamiętywaniu tej wartości w rejestrach procesora lub pamięci podręcznej. 
+W efekcie każde odczytanie lub zapisanie zmiennej zadeklarowanej jako volatile skutkuje bezpośrednim i fizycznym odwołaniem do pamięci RAM lub rejestru sprzętowego	
+	
+Zastosowanie:
+ - 	Rejestry układów peryferyjnych (MMIO): Sprzęt (np. licznik, timer lub stan portu GPIO) może samoczynnie zmienić wartość komórki pamięci. Bez volatile kompilator uznałby, że wartość się nie zmienia i pobrałby ją tylko raz.
+ -  Obsługa przerwań (ISR): Flagi globalne modyfikowane wewnątrz funkcji obsługi przerwania, a odczytywane w pętli głównej programu, muszą być volatile, aby pętla zauważyła ich zmianę.
+ -  Puste pętle opóźniające: Zapobiega wycięciu przez kompilator "pustych" pętli typu for(int i=0; i<1000; i++);, które bez volatile zostałyby całkowicie usunięte podczas optymalizacji kodu.
+ 
+ Jeśli używasz zaawansowanego mikrokontrolera z pamięcią podręczną (np. STM32H7, STM32F7), sam volatile może nie wystarczyć przy bardzo szybkich operacjach. Procesor posiada tzw. Store Buffer (bufor zapisu) i może opóźnić fizyczny zapis flagi do RAM-u o kilka cykli, zmieniając kolejność wykonywania instrukcji (instrukcje out-of-order).
+ Jeśli ustawiasz flagę i chcesz mieć absolutną pewność, że procesor fizycznie zapisał ją w pamięci przed wykonaniem kolejnej linijki kodu, użyj bariery danych:
+ 		dbg_dma_busy = 1;
+		__DSB(); 	 Data Synchronization Barrier - wymusza zakończenie wszystkich operacji na pamięci
+
+
+7------------- -taskENTER_CRITICAL() (fromISR) --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 	
+Zapewnia atomowość operacji (Read-Modify-Write). DLATEGO lepiej sosowac mutexy, semafory, kolejki, ktore zapewniaja atomowosc z założenia RTOS. 	
+Dla programisty linia dbg_dma_busy = 1; to jedna operacja. Dla procesora (np. ARM Cortex-M) są to trzy osobne instrukcje asemblera:
+   LDR 	     – Odczytaj wartość zmiennej z pamięci RAM do rejestru procesora.
+   ORR / MOV – Zmień wartość w rejestrze na 1.
+   STR 		 – Zapisz nową wartość z rejestru z powrotem do pamięci RAM.
+Jeżeli dowolne przerwanie (nawet niezwiązane z UARTEM) wejdzie pomiędzy krok 1 a krok 3, to inny wątek odczyta z pamięci RAM starą wartość (0), ponieważ nowa wartość (1) znajduje się na razie tylko w rejestrze procesora pierwszego wątku i nie została jeszcze zapisana do pamięci.	
+ 	
+ 	
+8------------- EVENT GROUP , SEMAFOR , EVENT_GROUP -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  	
+ -  Brak liczenia zdarzeń (Brak semantyki zliczającej):Flagi w Event Group działają jak zwykłe bity (0 lub 1). Jeśli przerwanie DMA wywoła się trzy razy i za każdym razem wstawi flagę EVENT_SPACE_AVAILABLE, to w grupie zdarzeń ten bit nadal będzie miał wartość 1. Wątek logujący, po wybudzeniu, skasuje ten bit. Jeśli w międzyczasie bufor zapełnił się i opróżnił wielokrotnie, stracisz informację o dokładnej liczbie "wybudzeń". Task Notifications działają jak szybki semafor zliczający – zapamiętują, ile dokładnie razy przerwanie wysłało sygnał.
+ -  Większy narzut procesora (Overhead):Event Groups są strukturami dość ciężkimi. Każda zmiana bitu z poziomu przerwania (xEventGroupSetBitsFromISR) nie dzieje się natychmiast. FreeRTOS pod maską wysyła wiadomość do dedykowanego wątku systemowego (Timer Task), który dopiero potem budzi Twój wątek. Wprowadza to spore opóźnienie (jitter) w transmisji UART.	
+ -  Problem z czyszczeniem bitów (Race Condition):Gdy wątek odczyta flagę z Event Group, musi ją wyczyścić. Jeśli przerwanie ustawi flagę dokładnie w tym samym momencie, w którym wątek ją odczytuje i automatycznie czyści (parametr pdTRUE w xEventGroupWaitBits), może dojść do sytuacji, w której sygnał od przerwania zostanie bezpowrotnie skasowany, zanim wątek go przetworzy. To zmusiłoby Cię do powrotu do... sekcji krytycznych.	
+ 		
+ 	- Task Notifications (Najlepsze): Najszybsze, zużywają najmniej RAM-u (0 dodatkowych bajtów, mechanizm wbudowany w TCB wątku), bezpieczne, posiadają tryb zliczający (działają jak semafor).
+ 	- Semafory binarne / zliczające (Dobre): Bezpieczne, czytelne w kodzie, ale zużywające więcej pamięci i wolniejsze niż Task Notifications.
+ 	- Event Groups (Najgorsze w tym przypadku): Wolne wywołanie z ISR (przez Timer Task), ryzyko utraty impulsów wybudzenia ze względu na brak zliczania, brak atomowości operacji na bitach w specyficznych sytuacjach wywłaszczan.
+
+
+9-------------_Min_Stack_Size ,  _Min_Heap_Size ,  configTOTAL_HEAP_SIZE -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 
+_Min_Stack_Size - Służy on systemowi tylko w dwóch sytuacjach (w przypadku RTOS):
+  - Od momentu włączenia mikrokontrolera do momentu wywołania funkcji vTaskStartScheduler() (czyli podczas startu i inicjalizacji peryferiów).
+  - Podczas obsługi wszystkich przerwań sprzętowych (ISR), np. odebrania danych z UART, timera czy naciśnięcia przycisku, gdy system już działa. Kiedy możesz go zmniejszyć? Jeśli Twoje procedury obsługi przerwań (funkcje IRQHandler) są krótkie, nie tworzą wielkich tablic lokalnych i nie wywołują głębokich zagnieżdżeń funkcji, możesz bezpiecznie zmniejszyć tę wartość np. do 0x400 (1 KB) lub 0x800 (2 KB).
+ 	
+ configTOTAL_HEAP_SIZE:
+  - Każde zadanie (Task), które tworzysz we FreeRTOS, otrzymuje swój własny, oddzielny stos. Pamięć na te stosy jest alokowana dynamicznie przez heap_4 z puli configTOTAL_HEAP_SIZE.	
+ 	
+	
+10---------------Mechanizmy RTOS`owe--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------		
+	
+	1).
+	if (xReceiverTaskHandle != NULL) {
+    	xTaskNotifyGive(xReceiverTaskHandle);								// WYSYŁANIE: Zwiększ wartość powiadomienia odbiorcy o 1
+    	printf("Nadawca: Wysłałem powiadomienie!\n");
+	}
+
+	ulNotificationValue = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);			// ODBIERANIE: Czekaj (blokuj wątek) aż przyjdzie powiadomienie			pdTRUE oznacza, że po odczycie licznik powiadomień zostanie wyzerowany
+
+	if (ulNotificationValue > 0) {
+		printf("Odbiorca: Otrzymałem powiadomienie! Wysyłam e-mail...\n");
+		// Tutaj wstaw kod do wysyłki e-maila przez komendy AT
+	}
+
+
+	2).
+	eSetValueWithOverwrite: 			Najczęstszy wybór. Odbiorca zawsze dostanie najnowszą wartość, stara (jeśli nie została odebrana) jest kasowana. Idealne do stanów i pomiarów.
+	eSetValueWithoutOverwrite:			Zapisze wartość tylko wtedy, gdy poprzednia została już odebrana. Jeśli nie – funkcja zwróci błąd (pdFAIL).
+	eSetBits: 							Traktuje powiadomienie jako flagi (bit po bicie). Pozwala ustawić konkretne bity bez zmieniania pozostałych (jak w Event Groups).
+
+   	sensorData = 25; 					// Przykładowa wartość (np. temperatura)
+   	xTaskNotify(xReceiverTaskHandle, sensorData, eSetValueWithOverwrite);    	 	// WYSYŁANIE:
+
+   	if (xTaskNotifyWait(0, 0, &receivedValue, portMAX_DELAY) == pdPASS) {			// ODBIERANIE:		xTaskNotifyWait(bitmask_na_wejsciu, bitmask_na_wyjsciu, &zmienna, czas)		bitmask: 0x00: Nie czyść nic , 0xFFFFFFFF (Wszystkie bity): Czyści całą wartość powiadomienia po wyjściu.
+       	printf("Odebrano wartość: %d\n", receivedValue);
+   	}
+
+
+11----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------	
+	
+	
+	
+	
+	
+	

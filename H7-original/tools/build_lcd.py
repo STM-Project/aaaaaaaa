@@ -1,0 +1,74 @@
+import argparse, secrets, re, pathlib, xml.etree.ElementTree as E, subprocess, concurrent.futures, json, os, shutil
+parser = argparse.ArgumentParser(description="Build the STM32H753 application.")
+parser.add_argument('--bootloader-app', action='store_true',
+                    help='link after the first 128 KiB flash sector and produce a raw BIN')
+args = parser.parse_args()
+root = pathlib.Path(__file__).resolve().parents[1]
+out = root / 'Debug' / ('bootloader-app' if args.bootloader_app else 'cloud')
+out.mkdir(parents=True, exist_ok=True)
+config=E.parse(root/'.cproject').getroot().find('.//configuration')
+if args.bootloader_app:
+    key_path = out / 'update-key'
+    try:
+        key = key_path.read_text(encoding='ascii').strip()
+    except FileNotFoundError:
+        key = secrets.token_hex(16)
+        with os.fdopen(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                       'w', encoding='ascii') as key_file:
+            key_file.write(key + '\n')
+    if not re.fullmatch(r'[0-9a-f]{32}', key):
+        parser.error('update-key must contain 32 lowercase hexadecimal characters')
+    key_header = out / 'h753_update_key.h'
+    with os.fdopen(os.open(key_header, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                   'w', encoding='ascii') as key_file:
+        key_file.write(f'#define H753_BOOT_UPDATE_KEY "{key}"\n')
+opts=config.findall('.//option')
+incs=[]; defs=[]
+for opt in opts:
+ s=opt.get('superClass','')
+ if '.c.compiler.' in s:
+  if opt.get('valueType')=='includePath': incs=['-I'+str((root/'Debug'/x.get('value')).resolve()) for x in opt]
+  if opt.get('valueType')=='definedSymbols': defs=['-D'+x.get('value') for x in opt]
+if args.bootloader_app: defs += ['-include', str(key_header)]
+overlay=out/'include'; overlay.mkdir(parents=True,exist_ok=True)
+headers={}
+for p in root.rglob('*.h'): headers.setdefault(p.name.lower(),[]).append(p)
+for p in root.rglob('*'):
+ if p.suffix in ('.c','.h'):
+  for name in re.findall(r'#\s*include\s*[<"]([^>"]+)[>"]',p.read_text(errors='replace')):
+   matches=headers.get(name.lower(),[])
+   if '/' not in name and len(matches)==1 and name!=matches[0].name:
+    dest=overlay/name
+    if not dest.exists(): dest.symlink_to(matches[0])
+incs.insert(0,'-I'+str(overlay))
+gcc=os.environ.get('ARM_GCC') or shutil.which('arm-none-eabi-gcc')
+if not gcc: raise SystemExit('Set ARM_GCC to arm-none-eabi-gcc or add it to PATH')
+flags=['-mcpu=cortex-m7','-mthumb','-mfpu=fpv5-d16','-mfloat-abi=hard','-O0','-g3','-ffunction-sections','-fdata-sections','-Wall','-std=gnu11','-Wno-error=implicit-function-declaration','-Wno-error=int-conversion','-Wno-error=incompatible-pointer-types']
+sources=[]
+for entry in config.findall('.//sourceEntries/entry'):
+ sources += sorted(p for p in (root/entry.get('name')).rglob('*') if p.suffix in ('.c','.s','.S'))
+def compile(p):
+ obj=out/(str(p.relative_to(root))+'.o'); obj.parent.mkdir(parents=True,exist_ok=True)
+ cmd=[gcc,*flags,*incs,*defs,'-c',str(p),'-o',str(obj)]
+ result=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+ return obj,result,cmd,p
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool: results=list(pool.map(compile,sources))
+errors=[]
+for obj,r,cmd,p in results:
+ if r.stdout: print(str(p.relative_to(root))+':\n'+r.stdout)
+ if r.returncode: errors.append(str(p.relative_to(root)))
+(out/'compile_commands.json').write_text(json.dumps([{'directory':str(root),'arguments':cmd,'file':str(p)} for _,_,cmd,p in results],indent=2))
+print(f'Compiled {len(sources)-len(errors)}/{len(sources)} sources; failures: {errors}')
+if errors: raise SystemExit(1)
+link_options = ["-Wl,--defsym=__bootloader_app=1"] if args.bootloader_app else []
+subprocess.run([gcc,*flags,*map(str,[x[0] for x in results]),*link_options,'-T'+str(root/'STM32H753BITX_FLASH.ld'),'--specs=nano.specs','--specs=nosys.specs','-Wl,--gc-sections','-Wl,-Map='+str(out/'firmware.map'),'-o',str(out/'firmware.elf'),'-Wl,--start-group','-lc','-lm','-Wl,--end-group'],check=True)
+# Same Intel HEX output enabled in STM32CubeIDE's Debug/Release settings.
+objcopy=pathlib.Path(gcc).with_name('arm-none-eabi-objcopy'+('.exe' if str(gcc).lower().endswith('.exe') else ''))
+subprocess.run([str(objcopy),'-O','ihex',str(out/'firmware.elf'),str(out/'firmware.hex')],check=True)
+print('HEX:',out/'firmware.hex')
+if args.bootloader_app:
+    subprocess.run([str(objcopy), '-O', 'binary', str(out / 'firmware.elf'),
+                    str(out / 'firmware.bin')], check=True)
+    print('BIN:', out / 'firmware.bin')
+size=pathlib.Path(gcc).with_name('arm-none-eabi-size')
+if size.exists(): subprocess.run([str(size),str(out/'firmware.elf')],check=True)
