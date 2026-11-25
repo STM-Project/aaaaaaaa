@@ -310,9 +310,7 @@ void SystemInit (void)
 #if defined(USER_VECT_TAB_ADDRESS)
   SCB->VTOR = VECT_TAB_BASE_ADDRESS | VECT_TAB_OFFSET; /* Explicit vector location override */
 #else
-  /* Use the address selected by the application linker script. */
-  extern const uint32_t g_pfnVectors[];
-  SCB->VTOR = (uint32_t)g_pfnVectors;
+  SCB->VTOR = FLASH_BANK1_BASE; /* Bootloader vectors: flash offset 0. */
 #endif /* USER_VECT_TAB_ADDRESS */
   __DSB();
   __ISB();

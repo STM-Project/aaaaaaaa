@@ -40,14 +40,10 @@ _estack = ORIGIN(RAM_D1) + LENGTH(RAM_D1);    /* end of RAM */
 _Min_Heap_Size = 0x4000;      /* required amount of heap  */
 _Min_Stack_Size = 0x4000; /* required amount of stack */
 
-/* The hosted build passes --defsym=__bootloader_app=1 before this script
-   to reserve the first flash erase sector for the bootloader. */
-__app_flash_offset = DEFINED(__bootloader_app) ? 128K : 0;
-
 /* Specify the memory areas */
 MEMORY
 {
-  FLASH (rx)     : ORIGIN = 0x08000000 + __app_flash_offset, LENGTH = 2048K - __app_flash_offset
+  FLASH (rx)     : ORIGIN = 0x08000000, LENGTH = 128K
   DTCMRAM (xrw)  : ORIGIN = 0x20000000, LENGTH = 128K
   RAM_D1 (xrw)   : ORIGIN = 0x24000000, LENGTH = 512K
   RAM_D2 (xrw)   : ORIGIN = 0x30000000, LENGTH = 288K
@@ -59,16 +55,17 @@ MEMORY
 /* Define output sections */
 SECTIONS
 {
+  /DISCARD/ : { *(.isr_vector) }
   /* The startup code goes first into FLASH */
   .isr_vector :
   {
     . = ALIGN(4);
-    KEEP(*(.isr_vector)) /* Startup code */
+    KEEP(*(.boot_vectors))
     . = ALIGN(4);
   } >FLASH
 
-  ASSERT(g_pfnVectors == ORIGIN(FLASH), "Application vectors must start at the flash origin")
-  ASSERT((g_pfnVectors & 0x3ff) == 0, "Application vectors must be 1 KiB aligned")
+  ASSERT(BootVectors == ORIGIN(FLASH), "Bootloader vectors must start at the flash origin")
+  ASSERT((BootVectors & 0x3ff) == 0, "Bootloader vectors must be 1 KiB aligned")
 
   /* The program code and other data goes into FLASH */
   .text :
