@@ -7,7 +7,7 @@
 
 #define ESP_ENABLE_PIN GPIO_PIN_9
 #define ESP_UART_PINS (GPIO_PIN_6 | GPIO_PIN_7)
-static UART_HandleTypeDef uart;
+static bool esp_uart_ready;
 
 uint32_t boot_millis(void)
 {
@@ -38,6 +38,7 @@ void boot_esp_power(bool enabled)
 
 bool boot_uart_init(uint32_t baud)
 {
+    esp_uart_ready = false;
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_USART6_CLK_ENABLE();
     __HAL_RCC_USART16_CONFIG(RCC_USART16CLKSOURCE_D2PCLK2);
@@ -50,26 +51,39 @@ bool boot_uart_init(uint32_t baud)
     gpio.Pin = GPIO_PIN_7;
     gpio.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOC, &gpio);
-    uart = (UART_HandleTypeDef){
-        .Instance = USART6,
-        .Init = {.BaudRate = baud, .WordLength = UART_WORDLENGTH_8B,
-                 .StopBits = UART_STOPBITS_1, .Parity = UART_PARITY_NONE,
-                 .Mode = UART_MODE_TX_RX, .HwFlowCtl = UART_HWCONTROL_NONE,
-                 .OverSampling = UART_OVERSAMPLING_16,
-                 .OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE,
-                 .ClockPrescaler = UART_PRESCALER_DIV1},
-        .AdvancedInit = {.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT,
-                         .Swap = UART_ADVFEATURE_SWAP_ENABLE}
-    };
-    /* Polling at 2 Mbaud needs the FIFO to absorb short interrupt latency. */
-    return HAL_UART_Init(&uart) == HAL_OK &&
-           HAL_UARTEx_EnableFifoMode(&uart) == HAL_OK;
+    /* The application HAL MSP setup also configures DMA and IRQs. The
+     * bootloader uses polled USART6 with the same clock, pins and TX/RX swap. */
+    USART6->BRR = (HAL_RCC_GetPCLK2Freq() + baud / 2u) / baud;
+    USART6->CR2 = USART_CR2_SWAP;
+    USART6->CR1 = USART_CR1_FIFOEN | USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+    uint32_t start = HAL_GetTick();
+    const uint32_t ready = USART_ISR_TEACK | USART_ISR_REACK;
+    while ((USART6->ISR & ready) != ready) {
+        if (HAL_GetTick() - start >= 20u)
+            return false;
+    }
+    esp_uart_ready = true;
+    return true;
 }
 
 bool boot_uart_send(const void *data, size_t length)
 {
-    return length <= UINT16_MAX &&
-           HAL_UART_Transmit(&uart, data, (uint16_t)length, 3000) == HAL_OK;
+    const uint8_t *bytes = data;
+    uint32_t start = HAL_GetTick();
+    if (!esp_uart_ready)
+        return false;
+    for (size_t i = 0; i < length; ++i) {
+        while (!(USART6->ISR & USART_ISR_TXE_TXFNF)) {
+            if (HAL_GetTick() - start >= 3000u)
+                return false;
+        }
+        USART6->TDR = bytes[i];
+    }
+    while (!(USART6->ISR & USART_ISR_TC)) {
+        if (HAL_GetTick() - start >= 3000u)
+            return false;
+    }
+    return true;
 }
 
 int boot_uart_read(uint32_t deadline)
@@ -172,7 +186,7 @@ _Noreturn void boot_jump_to_app(void)
     const volatile uint32_t *vectors = (const volatile uint32_t *)APP_FLASH_START;
     uint32_t msp = vectors[0], reset = vectors[1];
     boot_esp_power(false);
-    if (uart.Instance) {
+    if (esp_uart_ready) {
         __HAL_RCC_USART6_FORCE_RESET();
         __HAL_RCC_USART6_RELEASE_RESET();
         __HAL_RCC_USART6_CLK_DISABLE();

@@ -151,32 +151,55 @@ static bool read_wifi_address(bool station)
     return false;
 }
 
+static bool probe_at(void)
+{
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        if (command("AT\r\n"))
+            return true;
+        drain(30);
+    }
+    return false;
+}
+
 bool esp_start(const H753_BootRequest *request, const char *recovery_password)
 {
     boot_debug("ESP32: reset EN, sprawdzanie AT przy 115200 b/s.");
     boot_esp_power(false);
     boot_delay(100);
     boot_esp_power(true);
-    if (!boot_uart_init(ESP_BOOT_BAUD))
+    if (!boot_uart_init(ESP_BOOT_BAUD)) {
+        boot_debug("USART6: blad uruchomienia przy 115200 b/s.");
         return false;
+    }
     drain(900);
-    if (command("AT\r\n")) {
-        if (!command("ATE0\r\n") ||
-            !send_command("AT+UART_CUR=2000000,8,1,0,0\r\n"))
+    if (probe_at()) {
+        boot_debug("AT odpowiada przy 115200 b/s.");
+        if (!command("ATE0\r\n")) {
+            boot_debug("ATE0: brak potwierdzenia przy 115200 b/s.");
             return false;
-        /* Some ESP-AT versions send OK at the old baud, others switch first. */
+        }
+        if (!send_command("AT+UART_CUR=2000000,8,1,0,0\r\n")) {
+            boot_debug("AT+UART_CUR: blad wyslania.");
+            return false;
+        }
+        /* OK can arrive at either baud depending on the ESP-AT version. */
         drain(100);
-        if (!boot_uart_init(ESP_WORK_BAUD))
-            return false;
+    } else {
+        boot_debug("Brak AT przy 115200 b/s. Sprawdzam 2000000 b/s.");
     }
-    else if (!boot_uart_init(ESP_WORK_BAUD)) {
+    if (!boot_uart_init(ESP_WORK_BAUD) || !probe_at()) {
+        boot_debug("AT: brak odpowiedzi przy 2000000 b/s.");
         return false;
     }
-    boot_debug("ESP32: proba AT przy 2000000 b/s.");
-    if (!command("AT\r\n") || !command("ATE0\r\n") ||
-        !command("AT+GMR\r\n") || !command("AT+SYSSTORE=0\r\n"))
+    boot_debug("AT odpowiada przy 2000000 b/s.");
+    if (!command("ATE0\r\n")) {
+        boot_debug("ATE0: brak potwierdzenia przy 2000000 b/s.");
         return false;
-    boot_debug("ESP32 odpowiada przy 2000000 b/s.");
+    }
+    if (!command("AT+GMR\r\n"))
+        boot_debug("AT+GMR: brak odpowiedzi; kontynuuje.");
+    if (!command("AT+SYSSTORE=0\r\n"))
+        boot_debug("AT+SYSSTORE=0: brak potwierdzenia; kontynuuje.");
     if (request) {
         boot_debug("Konfiguracja STA, IP i DHCP z aplikacji.");
         if (!join_wifi(request))

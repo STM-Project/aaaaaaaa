@@ -29,6 +29,8 @@ void Boot_Main(void)
     boot_debug(requested ? "Przyjeto zadanie /upload. Tryb STA."
                          : "Brak poprawnej aplikacji. Tryb serwisowy AP.");
     boot_lcd_init();
+    /* Give LTDC time to show the title before starting ESP32. */
+    boot_delay(100);
     char recovery_password[17] = {0};
     for (;;) {
         if (!requested && !recovery_password[0] && !boot_recovery_password(recovery_password)) {
@@ -41,8 +43,11 @@ void Boot_Main(void)
         boot_lcd_status(requested ? "LACZENIE WIFI" : "SIEC SERWISOWA", 0);
         if (!esp_start(requested ? &request : 0, recovery_password)) {
             boot_debug("Start ESP32/HTTP nieudany.");
-            if (boot_app_is_valid())
+            boot_lcd_status("BLAD WIFI LUB HTTP", 0);
+            if (boot_app_is_valid()) {
+                boot_delay(3000);
                 NVIC_SystemReset();
+            }
             requested = false;
             boot_delay(1000);
             continue;

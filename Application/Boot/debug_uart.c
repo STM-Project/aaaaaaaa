@@ -1,4 +1,5 @@
 #include "debug_uart.h"
+#include "boot_lcd.h"
 #include "stm32h7xx_hal.h"
 
 #define DEBUG_BAUD 2000000u
@@ -38,6 +39,7 @@ static void write_text(const char *text, uint32_t start)
 
 void boot_debug(const char *message)
 {
+    boot_lcd_log(message);
     if (!debug_enabled)
         return;
     uint32_t start = HAL_GetTick();
